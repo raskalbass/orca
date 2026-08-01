@@ -5442,6 +5442,82 @@ describe('Store', () => {
     ).toEqual(['third.example', 'active.example:6768'])
   })
 
+  it('normalizes context-pressure thresholds and soft limits on every settings write', async () => {
+    const store = await createStore()
+
+    // Percents: rounded and clamped to 1–100; non-finite falls back to the default.
+    expect(
+      store.updateSettings({ contextPressureWarnPercent: 55.6 }).contextPressureWarnPercent
+    ).toBe(56)
+    expect(store.updateSettings({ contextPressureWarnPercent: 0 }).contextPressureWarnPercent).toBe(
+      1
+    )
+    expect(
+      store.updateSettings({ contextPressureCriticalPercent: 400 }).contextPressureCriticalPercent
+    ).toBe(100)
+    expect(
+      store.updateSettings({ contextPressureWarnPercent: Number.NaN }).contextPressureWarnPercent
+    ).toBe(70)
+    expect(
+      store.updateSettings({ contextPressureCriticalPercent: 'high' as never })
+        .contextPressureCriticalPercent
+    ).toBe(90)
+
+    const ordered = store.updateSettings({
+      contextPressureWarnPercent: 95,
+      contextPressureCriticalPercent: 80
+    })
+    expect(ordered.contextPressureWarnPercent).toBe(95)
+    expect(ordered.contextPressureCriticalPercent).toBe(95)
+
+    // Soft limits: positive finite integer caps only; junk entries dropped, non-object emptied.
+    const updated = store.updateSettings({
+      contextPressureSoftLimits: {
+        'model:claude-opus-5': 400_000.9,
+        'agent:codex': -1,
+        'agent:gemini': Number.NaN,
+        'claude-opus-5': 100_000,
+        '': 5
+      }
+    })
+    expect(updated.contextPressureSoftLimits).toEqual({ 'model:claude-opus-5': 400_000 })
+    expect(
+      store.updateSettings({ contextPressureSoftLimits: 'claude=1' as never })
+        .contextPressureSoftLimits
+    ).toEqual({})
+  })
+
+  it('normalizes context-pressure settings on load', async () => {
+    writeDataFile({
+      settings: {
+        contextPressureWarnPercent: 0,
+        contextPressureCriticalPercent: 'high',
+        contextPressureSoftLimits: {
+          ' Model:Claude-Opus-5 ': 400_000.9,
+          codex: -1
+        }
+      }
+    })
+
+    const settings = (await createStore()).getSettings()
+    expect(settings.contextPressureWarnPercent).toBe(1)
+    expect(settings.contextPressureCriticalPercent).toBe(90)
+    expect(settings.contextPressureSoftLimits).toEqual({ 'model:claude-opus-5': 400_000 })
+  })
+
+  it('orders context-pressure thresholds on load', async () => {
+    writeDataFile({
+      settings: {
+        contextPressureWarnPercent: 95,
+        contextPressureCriticalPercent: 80
+      }
+    })
+
+    const settings = (await createStore()).getSettings()
+    expect(settings.contextPressureWarnPercent).toBe(95)
+    expect(settings.contextPressureCriticalPercent).toBe(95)
+  })
+
   it('notifies settings listeners with changed keys only', async () => {
     const store = await createStore()
     const listener = vi.fn()
@@ -6797,6 +6873,81 @@ describe('Store', () => {
     expect(reloaded.getUI().browserKagiSessionLink).toBe(sessionLink)
   })
 
+  it('durably encrypts SSH PTY consumer ownership for process restart recovery', async () => {
+    const store = await createStore()
+    store.setGitHubCache({ pr: { 'o/r#1': { fetchedAt: 1 } as never }, issue: {} })
+    store.upsertSshPtyConsumerRecovery({
+      targetId: 'ssh-1',
+      clientInstanceId: 'client-1',
+      serverBuildId: 'relay-build-1',
+      clientGeneration: 3,
+      ownerGeneration: 5,
+      ownerLease: 'secret-owner-lease',
+      outputFlowControl: { version: 1, windowSu: 256 * 1024 }
+    })
+
+    const persisted = readDataFile() as {
+      sshPtyConsumerRecoveries: { ownerLease: string }[]
+    }
+    expect(persisted.sshPtyConsumerRecoveries[0]?.ownerLease).not.toBe('secret-owner-lease')
+    expect(existsSync(join(testState.dir, 'orca-github-cache.json'))).toBe(false)
+
+    const reloaded = await createStore()
+    expect(reloaded.getSshPtyConsumerRecovery('ssh-1')).toEqual({
+      targetId: 'ssh-1',
+      clientInstanceId: 'client-1',
+      serverBuildId: 'relay-build-1',
+      clientGeneration: 3,
+      ownerGeneration: 5,
+      ownerLease: 'secret-owner-lease',
+      outputFlowControl: { version: 1, windowSu: 256 * 1024 }
+    })
+  })
+
+  it('drops decrypted SSH PTY owner leases that exceed the relay protocol bound', async () => {
+    const oversizedLease = 'x'.repeat(513)
+    writeDataFile({
+      ...getDefaultPersistedState(testState.dir),
+      sshPtyConsumerRecoveries: [
+        {
+          targetId: 'ssh-1',
+          clientInstanceId: 'client-1',
+          serverBuildId: 'relay-build-1',
+          clientGeneration: 3,
+          ownerGeneration: 5,
+          ownerLease: Buffer.from(`encrypted:${oversizedLease}`, 'utf-8').toString('base64')
+        }
+      ]
+    })
+
+    const store = await createStore()
+
+    expect(store.getSshPtyConsumerRecovery('ssh-1')).toBeNull()
+  })
+
+  it('removes persisted SSH PTY consumer ownership with its target', async () => {
+    const store = await createStore()
+    store.addSshTarget({
+      id: 'ssh-1',
+      label: 'SSH 1',
+      host: 'example.test',
+      port: 22,
+      username: 'orca'
+    })
+    store.upsertSshPtyConsumerRecovery({
+      targetId: 'ssh-1',
+      clientInstanceId: 'client-1',
+      serverBuildId: 'relay-build-1',
+      clientGeneration: 3,
+      ownerGeneration: 5,
+      ownerLease: 'secret-owner-lease'
+    })
+
+    store.removeSshTarget('ssh-1')
+
+    expect(store.getSshPtyConsumerRecovery('ssh-1')).toBeNull()
+  })
+
   it('keeps plaintext Kagi session links readable for migration from older builds', async () => {
     const sessionLink = 'https://kagi.com/search?token=secret'
     writeDataFile({
@@ -7415,7 +7566,8 @@ describe('Store', () => {
       'cli',
       'comment',
       'ports',
-      'inline-agents'
+      'inline-agents',
+      'context-pressure'
     ])
     expect(store.getUI().worktreeCardProperties).not.toContain('branch')
     expect(store.getUI()._worktreeCardModeDefaulted).toBe(true)
@@ -7471,6 +7623,89 @@ describe('Store', () => {
     expect(store.getUI().worktreeCardProperties).not.toContain('branch')
     expect(store.getUI().worktreeCardProperties).not.toContain('ports')
     expect(store.getUI().worktreeCardProperties).not.toContain('inline-agents')
+  })
+
+  it('adds context pressure only to the previously auto-issued Default preset', async () => {
+    const legacyDefault = [
+      'status',
+      'unread',
+      'issue',
+      'linear-issue',
+      'pr',
+      'automation',
+      'cli',
+      'comment',
+      'ports',
+      'inline-agents'
+    ]
+    writeDataFile({
+      schemaVersion: 1,
+      repos: [],
+      worktreeMeta: {},
+      settings: { compactWorktreeCards: false },
+      ui: {
+        worktreeCardProperties: legacyDefault,
+        _worktreeCardModeDefaulted: true,
+        _inlineAgentsDefaultedForAllUsers: true,
+        _expandedWorktreeCardPropertiesDefaulted: true
+      },
+      githubCache: { pr: {}, issue: {} },
+      workspaceSession: {}
+    })
+    const store = await createStore()
+    expect(store.getUI().worktreeCardProperties).toContain('context-pressure')
+    expect(store.getUI()._contextPressureWorktreeCardPropertyDefaulted).toBe(true)
+  })
+
+  it('preserves customized Default properties during context pressure migration', async () => {
+    writeDataFile({
+      schemaVersion: 1,
+      repos: [],
+      worktreeMeta: {},
+      settings: { compactWorktreeCards: false },
+      ui: {
+        worktreeCardProperties: ['status', 'unread', 'pr'],
+        _worktreeCardModeDefaulted: true,
+        _inlineAgentsDefaultedForAllUsers: true,
+        _expandedWorktreeCardPropertiesDefaulted: true
+      },
+      githubCache: { pr: {}, issue: {} },
+      workspaceSession: {}
+    })
+    const store = await createStore()
+    expect(store.getUI().worktreeCardProperties).toEqual(['status', 'unread', 'jira-issue', 'pr'])
+    expect(store.getUI()._contextPressureWorktreeCardPropertyDefaulted).toBe(true)
+  })
+
+  it('does not restore context pressure after a post-migration opt-out', async () => {
+    writeDataFile({
+      schemaVersion: 1,
+      repos: [],
+      worktreeMeta: {},
+      settings: { compactWorktreeCards: false },
+      ui: {
+        worktreeCardProperties: [
+          'status',
+          'unread',
+          'issue',
+          'linear-issue',
+          'pr',
+          'automation',
+          'cli',
+          'comment',
+          'ports',
+          'inline-agents'
+        ],
+        _worktreeCardModeDefaulted: true,
+        _inlineAgentsDefaultedForAllUsers: true,
+        _expandedWorktreeCardPropertiesDefaulted: true,
+        _contextPressureWorktreeCardPropertyDefaulted: true
+      },
+      githubCache: { pr: {}, issue: {} },
+      workspaceSession: {}
+    })
+    const store = await createStore()
+    expect(store.getUI().worktreeCardProperties).not.toContain('context-pressure')
   })
 
   it('does not re-add branch after an explicit Default mode selection', async () => {
@@ -7655,11 +7890,11 @@ describe('Store', () => {
     const store = await createStore()
 
     expect(store.getSettings().compactWorktreeCards).toBe(true)
-    expect(store.getUI().worktreeCardProperties).toEqual(['status', 'unread'])
+    expect(store.getUI().worktreeCardProperties).toEqual(['status', 'unread', 'context-pressure'])
     expect(store.getUI().worktreeCardProperties).not.toContain('automation')
   })
 
-  it('preserves the current defaulted Compact preset without expanding display toggles', async () => {
+  it('upgrades the defaulted Compact preset without expanding display toggles', async () => {
     writeDataFile({
       schemaVersion: 1,
       repos: [],
@@ -7675,9 +7910,32 @@ describe('Store', () => {
     const store = await createStore()
 
     expect(store.getSettings().compactWorktreeCards).toBe(true)
-    expect(store.getUI().worktreeCardProperties).toEqual(['status', 'unread'])
+    // Defaulted presets track the current Compact preset, which now carries the
+    // (experimentally gated) context-pressure property.
+    expect(store.getUI().worktreeCardProperties).toEqual(['status', 'unread', 'context-pressure'])
     expect(store.getUI().worktreeCardProperties).not.toContain('ports')
     expect(store.getUI().worktreeCardProperties).not.toContain('inline-agents')
+  })
+
+  it('preserves a post-migration Compact context-pressure opt-out', async () => {
+    writeDataFile({
+      schemaVersion: 1,
+      repos: [],
+      worktreeMeta: {},
+      settings: { compactWorktreeCards: true },
+      ui: {
+        worktreeCardProperties: ['status', 'unread'],
+        _worktreeCardModeDefaulted: true,
+        _inlineAgentsDefaultedForAllUsers: true,
+        _expandedWorktreeCardPropertiesDefaulted: true,
+        _contextPressureWorktreeCardPropertyDefaulted: true
+      },
+      githubCache: { pr: {}, issue: {} },
+      workspaceSession: {}
+    })
+
+    const store = await createStore()
+    expect(store.getUI().worktreeCardProperties).toEqual(['status', 'unread', 'jira-issue'])
   })
 
   it.each([
@@ -7701,7 +7959,7 @@ describe('Store', () => {
       const store = await createStore()
 
       expect(store.getSettings().compactWorktreeCards).toBe(true)
-      expect(store.getUI().worktreeCardProperties).toEqual(['status', 'unread'])
+      expect(store.getUI().worktreeCardProperties).toEqual(['status', 'unread', 'context-pressure'])
       expect(store.getUI().worktreeCardProperties).not.toContain('automation')
       expect(store.getUI()._worktreeCardModeDefaulted).toBe(true)
     }

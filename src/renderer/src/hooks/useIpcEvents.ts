@@ -2266,6 +2266,7 @@ export function useIpcEvents(): void {
           // Agent/automation opens stay in the background (activate:false) in the active browser group.
           const workspace = store.createBrowserTab(worktreeId, data.url, {
             title: data.url,
+            allowWindowClose: true,
             targetGroupId: data.activate ? undefined : activeBrowserUnifiedTab?.groupId,
             sessionProfileId: data.sessionProfileId,
             sessionPartition: data.sessionPartition,
@@ -3091,7 +3092,8 @@ export function useIpcEvents(): void {
         lastAssistantMessage: data.lastAssistantMessage,
         interrupted: data.interrupted,
         // Why: same trap as interactivePrompt — this rebuild is a field whitelist, so subagent child rows vanish if omitted.
-        subagents: data.subagents
+        subagents: data.subagents,
+        contextUsage: data.contextUsage
       })
       if (!payload) {
         return 'dropped'

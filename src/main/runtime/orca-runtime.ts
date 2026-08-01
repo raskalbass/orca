@@ -43,6 +43,14 @@ import {
   type AgentStatusOrchestrationContext,
   type AgentStatusEntry
 } from '../../shared/agent-status-types'
+import {
+  agentContextUsageEqual,
+  resolveContextPressure,
+  resolveContextPressureConfigFromSettings,
+  type AgentContextUsage,
+  type ContextPressureConfig
+} from '../../shared/agent-context-pressure'
+import { clampUsedPercent } from '../../shared/usage-percentage-display'
 import { indexAgentStatusRowsByPaneKey } from '../agent-hooks/agent-status-pane-index'
 import type { AgentHookAuthorityAttestation } from '../agent-hooks/server'
 import type {
@@ -297,6 +305,7 @@ import {
   type RuntimeTerminalWaitBlockedReason,
   type RuntimeTerminalWaitCondition,
   type RuntimeWorktreePsSummary,
+  type RuntimeWorktreeAgentContextPressure,
   type RuntimeWorktreeAgentRow,
   type RuntimeWorktreeStatus,
   type RuntimeSpeechModelSummary,
@@ -1095,6 +1104,12 @@ type RuntimeStore = {
     githubProjects?: GlobalSettings['githubProjects']
     experimentalNewWorktreeCardStyle?: GlobalSettings['experimentalNewWorktreeCardStyle']
     compactWorktreeCards?: GlobalSettings['compactWorktreeCards']
+    // Why: worktree.ps computes each mobile agent row's context pressure
+    // host-side, so the gate and thresholds never need to cross to clients.
+    experimentalContextPressure?: GlobalSettings['experimentalContextPressure']
+    contextPressureWarnPercent?: GlobalSettings['contextPressureWarnPercent']
+    contextPressureCriticalPercent?: GlobalSettings['contextPressureCriticalPercent']
+    contextPressureSoftLimits?: GlobalSettings['contextPressureSoftLimits']
     minimaxGroupId?: GlobalSettings['minimaxGroupId']
     minimaxUsageModels?: GlobalSettings['minimaxUsageModels']
     prBotAuthorOverrides?: GlobalSettings['prBotAuthorOverrides']
@@ -1453,6 +1468,39 @@ type RuntimeAgentRowSnapshot = {
   // When the current payload.state was first observed for this pane (ms).
   stateStartedAt: number
   updatedAt: number
+}
+
+/** Host-computed pressure for one worktree.ps agent row, or undefined when the
+ *  experimental gate is off or the session has no usable reading — the wire
+ *  field stays absent so mobile honestly renders nothing. */
+function resolveWorktreeAgentRowContextPressure(
+  src: {
+    contextUsage: AgentContextUsage | null | undefined
+    model: string | null
+    agentType: string | null
+  },
+  config: ContextPressureConfig | null
+): RuntimeWorktreeAgentContextPressure | undefined {
+  if (!config || !src.contextUsage) {
+    return undefined
+  }
+  const snapshot = resolveContextPressure({
+    usage: src.contextUsage,
+    model: src.model,
+    agentType: src.agentType,
+    config
+  })
+  // Why clamp: integer percent keeps polled rows byte-stable between readings.
+  return snapshot
+    ? {
+        level: snapshot.level,
+        usedPercent: clampUsedPercent(snapshot.usedPercent),
+        usedTokens: snapshot.usedTokens,
+        limitTokens: snapshot.limitTokens,
+        limitSource: snapshot.limitSource,
+        usedTokensSource: snapshot.usedTokensSource
+      }
+    : undefined
 }
 
 type RuntimeHeadlessTerminal = {
@@ -4561,14 +4609,14 @@ export class OrcaRuntimeService {
     return this.startedAt
   }
 
-  private getWorkspaceSessionHostIdForWorktree(worktreeId: string): ExecutionHostId {
+  private tryGetWorkspaceSessionHostIdForWorktree(worktreeId: string): ExecutionHostId | null {
     const scope = parseWorkspaceKey(worktreeId)
     if (scope?.type === 'folder') {
       const workspace = this.store
         ?.getFolderWorkspaces?.()
         .find((entry) => entry.id === scope.folderWorkspaceId)
       if (!workspace) {
-        throw new Error('folder_workspace_not_found')
+        return null
       }
       const connectionId = this.resolveFolderWorkspaceConnectionId(workspace)
       return connectionId ? toSshExecutionHostId(connectionId) : LOCAL_EXECUTION_HOST_ID
@@ -4578,11 +4626,17 @@ export class OrcaRuntimeService {
     return repo ? getRepoExecutionHostId(repo) : LOCAL_EXECUTION_HOST_ID
   }
 
+  private getWorkspaceSessionHostIdForWorktree(worktreeId: string): ExecutionHostId {
+    const hostId = this.tryGetWorkspaceSessionHostIdForWorktree(worktreeId)
+    if (!hostId) {
+      throw new Error('folder_workspace_not_found')
+    }
+    return hostId
+  }
+
   private getWorkspaceSessionForWorktree(worktreeId: string): WorkspaceSessionState | null {
-    return (
-      this.store?.getWorkspaceSession?.(this.getWorkspaceSessionHostIdForWorktree(worktreeId)) ??
-      null
-    )
+    const hostId = this.tryGetWorkspaceSessionHostIdForWorktree(worktreeId)
+    return hostId ? (this.store?.getWorkspaceSession?.(hostId) ?? null) : null
   }
 
   private setWorkspaceSessionForWorktree(worktreeId: string, session: WorkspaceSessionState): void {
@@ -4609,6 +4663,56 @@ export class OrcaRuntimeService {
       }
     }
     return worktreeIds
+  }
+
+  private getWorkspaceSessionHydrationTargets(
+    includeAllPersistedWorktrees: boolean
+  ): Map<string, WorkspaceSessionState> {
+    const repos = this.store?.getRepos?.() ?? []
+    const repoHostIdByRepoId = new Map(
+      repos.map((repo) => [repo.id, getRepoExecutionHostId(repo)] as const)
+    )
+    const folderHostIdByWorkspaceId = new Map(
+      (this.store?.getFolderWorkspaces?.() ?? []).map((workspace) => {
+        const connectionId = this.resolveFolderWorkspaceConnectionId(workspace)
+        return [
+          workspace.id,
+          connectionId ? toSshExecutionHostId(connectionId) : LOCAL_EXECUTION_HOST_ID
+        ] as const
+      })
+    )
+    const hostIds = new Set<ExecutionHostId>(['local'])
+    for (const repo of repos) {
+      hostIds.add(getRepoExecutionHostId(repo))
+    }
+    for (const hostId of this.store?.getWorkspaceSessionHostIds?.() ?? []) {
+      hostIds.add(hostId)
+    }
+
+    const targets = new Map<string, WorkspaceSessionState>()
+    for (const hostId of hostIds) {
+      const session = this.store?.getWorkspaceSession?.(hostId)
+      if (!session) {
+        continue
+      }
+      for (const [worktreeId, tabs] of Object.entries(session.tabsByWorktree ?? {})) {
+        const scope = parseWorkspaceKey(worktreeId)
+        const ownerHostId =
+          scope?.type === 'folder'
+            ? (folderHostIdByWorkspaceId.get(scope.folderWorkspaceId) ?? null)
+            : (repoHostIdByRepoId.get(
+                getRepoIdFromWorktreeId(scope?.type === 'worktree' ? scope.worktreeId : worktreeId)
+              ) ?? LOCAL_EXECUTION_HOST_ID)
+        if (
+          ownerHostId === hostId &&
+          (includeAllPersistedWorktrees ||
+            this.workspaceSessionWorktreeHasRuntimeOwnedPtyCandidate(session, worktreeId, tabs))
+        ) {
+          targets.set(worktreeId, session)
+        }
+      }
+    }
+    return targets
   }
 
   getStatus(): RuntimeStatus {
@@ -5475,6 +5579,8 @@ export class OrcaRuntimeService {
       force?: boolean
       allowAttachedWindow?: boolean
       onlyRuntimeOwnedTerminals?: boolean
+      runtimeOwnedTerminalCandidateKnown?: boolean
+      workspaceSession?: WorkspaceSessionState
     } = {}
   ): Set<string> {
     // Why: report which worktrees were reconciled in place so callers don't
@@ -5483,9 +5589,11 @@ export class OrcaRuntimeService {
     if (this.getAvailableAuthoritativeWindow() && options.allowAttachedWindow !== true) {
       return reconciledWorktreeIds
     }
-    const session = worktreeId
-      ? this.getWorkspaceSessionForWorktree(worktreeId)
-      : this.store?.getWorkspaceSession?.()
+    const session =
+      options.workspaceSession ??
+      (worktreeId
+        ? this.getWorkspaceSessionForWorktree(worktreeId)
+        : this.store?.getWorkspaceSession?.())
     if (!session) {
       return reconciledWorktreeIds
     }
@@ -5497,7 +5605,14 @@ export class OrcaRuntimeService {
     if (
       options.onlyRuntimeOwnedTerminals === true &&
       !this.offscreenBrowserBackend &&
-      !this.workspaceSessionHasRuntimeOwnedPtyCandidate(session)
+      options.runtimeOwnedTerminalCandidateKnown !== true &&
+      !(worktreeId
+        ? this.workspaceSessionWorktreeHasRuntimeOwnedPtyCandidate(
+            session,
+            worktreeId,
+            session.tabsByWorktree[worktreeId] ?? []
+          )
+        : this.workspaceSessionHasRuntimeOwnedPtyCandidate(session))
     ) {
       return reconciledWorktreeIds
     }
@@ -5542,7 +5657,8 @@ export class OrcaRuntimeService {
       }
       const terminalTabs = this.buildHeadlessMobileSessionTerminalTabs(
         entryWorktreeId,
-        persistedTabs
+        persistedTabs,
+        session
       ).filter(
         (tab) =>
           options.onlyRuntimeOwnedTerminals !== true ||
@@ -5854,24 +5970,28 @@ export class OrcaRuntimeService {
   }
 
   private workspaceSessionHasRuntimeOwnedPtyCandidate(session: WorkspaceSessionState): boolean {
-    for (const tabs of Object.values(session.tabsByWorktree ?? {})) {
-      for (const tab of tabs) {
-        if (this.isServeOrSshOwnedPtyId(tab.ptyId)) {
-          return true
-        }
-        const leafPtyIds = session.terminalLayoutsByTabId?.[tab.id]?.ptyIdsByLeafId
-        if (
-          leafPtyIds &&
-          Object.values(leafPtyIds).some((ptyId) => this.isServeOrSshOwnedPtyId(ptyId))
-        ) {
-          return true
-        }
-      }
-    }
-    // Why: expiry clears the stale PTY id but retains pane coordinates so paired viewers can ask the HUB for a fresh shell.
     return Object.entries(session.tabsByWorktree ?? {}).some(([worktreeId, tabs]) =>
-      tabs.some((tab) => this.getRecentExpiredSshLease(worktreeId, tab.id, undefined) !== null)
+      this.workspaceSessionWorktreeHasRuntimeOwnedPtyCandidate(session, worktreeId, tabs)
     )
+  }
+
+  private workspaceSessionWorktreeHasRuntimeOwnedPtyCandidate(
+    session: WorkspaceSessionState,
+    worktreeId: string,
+    tabs: WorkspaceSessionState['tabsByWorktree'][string]
+  ): boolean {
+    return tabs.some((tab) => {
+      if (this.isServeOrSshOwnedPtyId(tab.ptyId)) {
+        return true
+      }
+      const leafPtyIds = session.terminalLayoutsByTabId?.[tab.id]?.ptyIdsByLeafId
+      return (
+        (leafPtyIds &&
+          Object.values(leafPtyIds).some((ptyId) => this.isServeOrSshOwnedPtyId(ptyId))) ||
+        // Why: expiry keeps pane coordinates so paired viewers can request a fresh shell.
+        this.getRecentExpiredSshLease(worktreeId, tab.id, undefined) !== null
+      )
+    })
   }
 
   private getRecentExpiredSshLease(
@@ -6482,12 +6602,9 @@ export class OrcaRuntimeService {
 
   private buildHeadlessMobileSessionTerminalTabs(
     worktreeId: string,
-    persistedTabs: readonly TerminalTab[]
+    persistedTabs: readonly TerminalTab[],
+    session: WorkspaceSessionState
   ): RuntimeMobileSessionTerminalTab[] {
-    const session = this.getWorkspaceSessionForWorktree(worktreeId)
-    if (!session) {
-      return []
-    }
     return [...persistedTabs]
       .sort((a, b) => a.sortOrder - b.sortOrder || a.createdAt - b.createdAt)
       .flatMap((tab, index) => {
@@ -6519,7 +6636,13 @@ export class OrcaRuntimeService {
               ...(tab.color != null ? { color: tab.color } : {}),
               ...(tab.isPinned ? { isPinned: true } : {}),
               ...(tab.viewMode ? { viewMode: tab.viewMode } : {}),
-              isActive: this.isPersistedTerminalLeafActive(worktreeId, tab.id, leafId, layout)
+              isActive: this.isPersistedTerminalLeafActive(
+                session,
+                worktreeId,
+                tab.id,
+                leafId,
+                layout
+              )
             }
           ]
         })
@@ -6708,13 +6831,13 @@ export class OrcaRuntimeService {
   }
 
   private isPersistedTerminalLeafActive(
+    session: WorkspaceSessionState,
     worktreeId: string,
     tabId: string,
     leafId: string,
     layout: TerminalLayoutSnapshot | undefined
   ): boolean {
-    const session = this.getWorkspaceSessionForWorktree(worktreeId)
-    const activeTabId = session?.activeTabIdByWorktree?.[worktreeId] ?? session?.activeTabId
+    const activeTabId = session.activeTabIdByWorktree?.[worktreeId] ?? session.activeTabId
     return activeTabId === tabId && (!layout?.activeLeafId || layout.activeLeafId === leafId)
   }
 
@@ -10020,12 +10143,21 @@ export class OrcaRuntimeService {
     // updatedAt) — mirrors AgentStatusEntry.stateStartedAt on the desktop side.
     const stateStartedAt =
       previous && previous.payload.state === payload.state ? previous.stateStartedAt : now
+    // Why: an agentType change means a new session whose reading no longer applies —
+    // mirrors the hook server's preservation guard so a successor agent never wears
+    // the predecessor's stale reading.
+    const retainedPayload =
+      payload.contextUsage === undefined &&
+      previous &&
+      previous.payload.agentType === payload.agentType
+        ? { ...payload, contextUsage: previous.payload.contextUsage }
+        : payload
     this.latestAgentStatusByPaneKey.set(paneKey, {
       paneKey,
       ptyId,
       worktreeId,
       tabId,
-      payload,
+      payload: retainedPayload,
       stateStartedAt,
       updatedAt: now
     })
@@ -10038,7 +10170,8 @@ export class OrcaRuntimeService {
       (previous.payload.agentType ?? null) !== (payload.agentType ?? null) ||
       (previous.payload.toolName ?? null) !== (payload.toolName ?? null) ||
       (previous.payload.interactivePrompt ?? null) !== (payload.interactivePrompt ?? null) ||
-      (previous.payload.interrupted ?? false) !== (payload.interrupted ?? false)
+      (previous.payload.interrupted ?? false) !== (payload.interrupted ?? false) ||
+      !agentContextUsageEqual(previous.payload.contextUsage, retainedPayload.contextUsage)
     )
   }
 
@@ -15845,7 +15978,11 @@ export class OrcaRuntimeService {
       return {
         handle,
         isRunningAgent,
-        status: isRunningAgent ? explicitStatus.status : null
+        status: isRunningAgent ? explicitStatus.status : null,
+        // Why: a reclaimed shell isn't running the reporting agent — its reading no longer applies.
+        ...(isRunningAgent && explicitStatus.contextUsage != null
+          ? { contextUsage: explicitStatus.contextUsage }
+          : {})
       }
     }
     if (terminal.titleStatus) {
@@ -16111,15 +16248,18 @@ export class OrcaRuntimeService {
   private getFreshExplicitAgentStatusForHandle(handle: string): {
     status: NonNullable<RuntimeTerminalAgentStatus['status']>
     updatedAt: number
+    contextUsage: AgentContextUsage | null | undefined
   } | null {
     const paneKey = this.getPaneKeyForTerminalHandle(handle)
     const now = Date.now()
     let bestStatus: NonNullable<RuntimeTerminalAgentStatus['status']> | null = null
     let bestUpdatedAt = -1
+    let bestContextUsage: AgentContextUsage | null | undefined
 
     const consider = (
       state: AgentStatusEntry['state'] | undefined,
-      updatedAt: number | null | undefined
+      updatedAt: number | null | undefined,
+      contextUsage: AgentContextUsage | null | undefined
     ): void => {
       if (!state) {
         return
@@ -16133,22 +16273,25 @@ export class OrcaRuntimeService {
       if (updatedAt > bestUpdatedAt || (updatedAt === bestUpdatedAt && status === 'permission')) {
         bestStatus = status
         bestUpdatedAt = updatedAt
+        bestContextUsage = contextUsage
       }
     }
 
     if (paneKey) {
       const retained = this.latestAgentStatusByPaneKey.get(paneKey)
-      consider(retained?.payload.state, retained?.updatedAt)
+      consider(retained?.payload.state, retained?.updatedAt, retained?.payload.contextUsage)
     }
 
     for (const entry of this.getAgentStatusSnapshotFn?.() ?? []) {
       if (entry.terminalHandle !== handle && (!paneKey || entry.paneKey !== paneKey)) {
         continue
       }
-      consider(entry.state, entry.receivedAt)
+      consider(entry.state, entry.receivedAt, entry.contextUsage)
     }
 
-    return bestStatus ? { status: bestStatus, updatedAt: bestUpdatedAt } : null
+    return bestStatus
+      ? { status: bestStatus, updatedAt: bestUpdatedAt, contextUsage: bestContextUsage }
+      : null
   }
 
   private async writeTerminalAction(
@@ -16923,6 +17066,7 @@ export class OrcaRuntimeService {
         worktreeId?: string
         state: ParsedAgentStatusPayload['state']
         agentType: string | null
+        model: string | null
         prompt: string
         lastAssistantMessage: string | null
         toolName: string | null
@@ -16930,6 +17074,7 @@ export class OrcaRuntimeService {
         interrupted: boolean
         stateStartedAt: number
         updatedAt: number
+        contextUsage: AgentContextUsage | null | undefined
       }
     >()
     for (const snapshot of this.latestAgentStatusByPaneKey.values()) {
@@ -16940,13 +17085,15 @@ export class OrcaRuntimeService {
         worktreeId: snapshot.worktreeId,
         state: payload.state,
         agentType: payload.agentType ?? null,
+        model: payload.model ?? null,
         prompt: payload.prompt,
         lastAssistantMessage: payload.lastAssistantMessage ?? null,
         toolName: payload.toolName ?? null,
         toolInput: payload.toolInput ?? null,
         interrupted: payload.interrupted ?? false,
         stateStartedAt: snapshot.stateStartedAt,
-        updatedAt: snapshot.updatedAt
+        updatedAt: snapshot.updatedAt,
+        contextUsage: payload.contextUsage
       })
     }
     for (const entry of this.getAgentStatusSnapshotFn?.() ?? []) {
@@ -16954,6 +17101,17 @@ export class OrcaRuntimeService {
       // Why: hook rows win ties, but an older cached hook must not replace a
       // fresh OSC status and make a running mobile workspace look inactive.
       if (existing && existing.updatedAt > entry.receivedAt) {
+        // Why: OSC rows rarely carry a reading/model (undefined = "no update"), so the
+        // winning row inherits the losing hook row's known values — otherwise the mobile
+        // dot flaps off after every OSC ping until the next statusline post.
+        if (existing.agentType === (entry.agentType ?? null)) {
+          if (existing.contextUsage === undefined && entry.contextUsage !== undefined) {
+            existing.contextUsage = entry.contextUsage
+          }
+          if (existing.model === null && entry.model != null) {
+            existing.model = entry.model
+          }
+        }
         continue
       }
       rowSources.set(entry.paneKey, {
@@ -16962,13 +17120,15 @@ export class OrcaRuntimeService {
         worktreeId: entry.worktreeId,
         state: entry.state,
         agentType: entry.agentType ?? null,
+        model: entry.model ?? null,
         prompt: entry.prompt,
         lastAssistantMessage: entry.lastAssistantMessage ?? null,
         toolName: entry.toolName ?? null,
         toolInput: entry.toolInput ?? null,
         interrupted: entry.interrupted ?? false,
         stateStartedAt: entry.stateStartedAt,
-        updatedAt: entry.receivedAt
+        updatedAt: entry.receivedAt,
+        contextUsage: entry.contextUsage
       })
     }
     if (rowSources.size === 0) {
@@ -16977,6 +17137,10 @@ export class OrcaRuntimeService {
     const orchestrationByPaneKey = this.buildAgentOrchestrationByPaneKey()
     const rowsByWorktree = new Map<string, RuntimeWorktreeAgentRow[]>()
     const now = Date.now()
+    // Resolved once per worktree.ps build; null when the experimental flag is off.
+    const contextPressureConfig = this.store?.getSettings
+      ? resolveContextPressureConfigFromSettings(this.store.getSettings())
+      : null
     for (const src of rowSources.values()) {
       // Why: hooks retain launch-time attribution across automatic workspace
       // renames; the tab's current mirrored owner is authoritative when present.
@@ -16997,6 +17161,7 @@ export class OrcaRuntimeService {
       }
       const taskTitle = orchestrationByPaneKey?.[src.paneKey]?.taskTitle ?? null
       const displayName = orchestrationByPaneKey?.[src.paneKey]?.displayName ?? null
+      const contextPressure = resolveWorktreeAgentRowContextPressure(src, contextPressureConfig)
       const row: RuntimeWorktreeAgentRow = {
         paneKey: src.paneKey,
         parentPaneKey: orchestrationByPaneKey?.[src.paneKey]?.parentPaneKey ?? null,
@@ -17010,7 +17175,8 @@ export class OrcaRuntimeService {
         toolInput: src.toolInput,
         interrupted: src.interrupted,
         stateStartedAt: src.stateStartedAt,
-        updatedAt: src.updatedAt
+        updatedAt: src.updatedAt,
+        ...(contextPressure ? { contextPressure } : {})
       }
       // Why: SSH/runtime projections can spell an equivalent path differently;
       // bucket by the canonical summary id so mobile keeps the agent activity.
@@ -28248,15 +28414,23 @@ export class OrcaRuntimeService {
       missingSnapshotOnly: true,
       notify: false
     })
-    const worktreeIdsToHydrate = this.getKnownWorkspaceSessionWorktreeIds()
-    for (const snapshot of snapshots) {
-      worktreeIdsToHydrate.add(snapshot.worktree)
+    // Why: graph sync must scan each persisted host session once, not once per workspace.
+    const worktreeSessionsToHydrate = new Map<string, WorkspaceSessionState | null>(
+      this.getWorkspaceSessionHydrationTargets(Boolean(this.offscreenBrowserBackend))
+    )
+    if (this.offscreenBrowserBackend) {
+      for (const snapshot of snapshots) {
+        if (!worktreeSessionsToHydrate.has(snapshot.worktree)) {
+          worktreeSessionsToHydrate.set(snapshot.worktree, null)
+        }
+      }
     }
     // Why: an empty renderer publication after HUB restart must not hide SSH panes persisted in this HUB's host partition.
-    for (const worktreeId of worktreeIdsToHydrate) {
+    for (const [worktreeId, workspaceSession] of worktreeSessionsToHydrate) {
       this.hydrateHeadlessMobileSessionTabsFromWorkspaceSession(worktreeId, {
         allowAttachedWindow: true,
-        onlyRuntimeOwnedTerminals: true
+        onlyRuntimeOwnedTerminals: true,
+        ...(workspaceSession ? { runtimeOwnedTerminalCandidateKnown: true, workspaceSession } : {})
       })
     }
     const nextWorktrees = new Set<string>()

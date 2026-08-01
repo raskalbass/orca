@@ -35,8 +35,13 @@ import {
   initDaemonPtyProvider,
   disconnectDaemon,
   getDaemonProvider,
+  listLiveDaemonPtyIds,
   shutdownDaemon
 } from './daemon/daemon-init'
+import {
+  hasRecordedLegacySharedCodexPane,
+  reconcileCodexPaneAccountsWithLivePtys
+} from './codex/codex-pane-account-registry'
 import { closeAllWatchers } from './ipc/filesystem-watcher'
 import { disposeWorktreeBaseDirectoryWatchers } from './ipc/worktree-base-directory-watcher'
 import { registerCoreHandlers } from './ipc/register-core-handlers'
@@ -223,6 +228,7 @@ import {
 } from './claude-accounts/live-pty-gate'
 import { StarNagService } from './star-nag/service'
 import { agentHookServer, type AgentHookProviderSessionIdentity } from './agent-hooks/server'
+import { claudeHookService } from './claude/hook-service'
 import { createHookProviderSessionInvalidator } from './agent-hooks/hook-provider-session-invalidation'
 import { wslHookRelayManager } from './agent-hooks/wsl-hook-relay-manager'
 import { maybeAutoRenameBranchOnFirstWork } from './agent-hooks/first-work-branch-rename'
@@ -844,6 +850,14 @@ function startTerminalRuntimeStartupServices(): Promise<void> {
       await initDaemonPtyProvider(signal, {
         macosLoginSessionWatch: process.platform === 'darwin' && !isServeMode
       })
+      if (codexRuntimeHome?.isHostSystemDefaultRealHome() && hasRecordedLegacySharedCodexPane()) {
+        const livePtyIds = await listLiveDaemonPtyIds()
+        if (livePtyIds) {
+          reconcileCodexPaneAccountsWithLivePtys(livePtyIds)
+        }
+      }
+      // Why: retained shells can invoke Codex immediately after the startup gate.
+      codexRuntimeHome?.reconcileLegacySharedHomeForRetainedPanes()
       logStartupMilestone('startup-service-done', { service: 'daemon-pty-provider' })
     },
     // Why: PTY spawn env reads ORCA_AGENT_HOOK_* from live server state, so the renderer awaits this before restored terminals reconnect.
@@ -2029,10 +2043,25 @@ void app.whenReady().then(async () => {
   const activeOrcaProfile = ensureActiveOrcaProfile()
   store = new Store({ dataFile: activeOrcaProfile.dataFile })
   wslHookRelayManager.setManagedHookSettingsResolver(() => store?.getSettings() ?? null)
+  agentHookServer.setContextPressureEnabled(
+    store.getSettings().experimentalContextPressure === true
+  )
+  claudeHookService.setContextPressureEnabled(
+    store.getSettings().experimentalContextPressure === true
+  )
+  wslHookRelayManager.setContextPressureEnabled(
+    store.getSettings().experimentalContextPressure === true
+  )
   logStartupMilestone('store-loaded')
   // Why: apply initial fallback WSL distro from store settings for global git/CLI calls.
   setDefaultWslDistroOverride(store.getSettings().terminalWindowsWslDistro ?? null)
   store.onSettingsChanged((updates, settings) => {
+    if ('experimentalContextPressure' in updates) {
+      const enabled = settings.experimentalContextPressure === true
+      agentHookServer.setContextPressureEnabled(enabled)
+      claudeHookService.setContextPressureEnabled(enabled)
+      wslHookRelayManager.setContextPressureEnabled(enabled)
+    }
     if ('terminalWindowsWslDistro' in updates) {
       // Why: synchronize fallback WSL distro updates to runner.
       setDefaultWslDistroOverride(settings.terminalWindowsWslDistro ?? null)
