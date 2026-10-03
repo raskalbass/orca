@@ -45,7 +45,7 @@ export const AGENT_STATUS_LEGACY_INGRESS_MANIFEST = Object.freeze([
   }),
   entry({
     caller: 'main-context-usage-update',
-    sourcePath: 'src/main/agent-hooks/server/server-status-update.ts',
+    sourcePath: 'src/main/agent-hooks/server/server-context-usage.ts',
     reason: 'A validated context-usage reading updates the owning pane row in place.',
     owner: 'main-agent-hooks',
     destination: '2B',
