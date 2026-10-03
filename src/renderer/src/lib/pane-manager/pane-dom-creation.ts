@@ -14,6 +14,7 @@ import { shouldFocusTerminalFromPanePointerDown } from './pane-pointer-focus'
 import { ENABLE_WEBGL_RENDERER } from './pane-webgl-renderer'
 import { installGuardedLinkProviderRegistration } from './terminal-link-provider-guard'
 import { installWindowsCtrlAltChordRepair } from './terminal-windows-ctrl-alt-chord-classification'
+import { installTerminalMouseEncodingTracker } from './terminal-mouse-encoding-tracker'
 
 function defaultLinkTooltipText(uri: string, openLinkHint: string): string {
   return `${uri} (${openLinkHint})`
@@ -51,6 +52,8 @@ export function createPaneDOM(
   // provider registered after this point — addon-internal and Orca's own.
   installGuardedLinkProviderRegistration(terminal)
   installWindowsCtrlAltChordRepair(terminal)
+  // Why here: the tracker must see every byte, including the first snapshot replay.
+  const mouseEncodingTrackerDisposable = installTerminalMouseEncodingTracker(terminal)
   const fitAddon = new FitAddon()
   const searchAddon = new SearchAddon()
   const unicode11Addon = new Unicode11Addon()
@@ -70,16 +73,16 @@ export function createPaneDOM(
   const paneDragCleanup = attachPaneDrag(dragHandle, id, dragState, dragCallbacks)
 
   const webLinksAddon = new WebLinksAddon(
-    options.onLinkClick ? (event, uri) => options.onLinkClick!(event, uri) : undefined,
+    options.onLinkClick ? (event, uri) => options.onLinkClick!(id, event, uri) : undefined,
     {
       hover: (_event, uri) => {
         if (uri) {
           linkTooltipHoverToken += 1
           const hoverToken = linkTooltipHoverToken
-          const openLinkHint = options.linkOpenHint()
+          const openLinkHint = options.linkOpenHint(id)
           linkTooltip.textContent = defaultLinkTooltipText(uri, openLinkHint)
           linkTooltip.style.display = ''
-          const formatted = options.formatLinkTooltip?.(uri, openLinkHint)
+          const formatted = options.formatLinkTooltip?.(id, uri, openLinkHint)
           if (formatted && typeof formatted === 'object' && 'then' in formatted) {
             void formatted.then(
               (nextText) => {
@@ -121,6 +124,7 @@ export function createPaneDOM(
     gpuRenderingEnabled: ENABLE_WEBGL_RENDERER,
     webglAttachmentDeferred: false,
     webglDisabledAfterContextLoss: false,
+    webglRebuildDeferred: false,
     hasComplexScriptOutput: false,
     fitAddon,
     fitResizeObserver: null,
@@ -133,12 +137,16 @@ export function createPaneDOM(
     webLinksAddon,
     webglAddon: null,
     ligaturesAddon: null,
+    imageAddon: null,
+    imageAttachmentDeferred: false,
     panePointerDownHandler,
     paneMouseEnterHandler,
     paneDragCleanup,
     compositionHandler: null,
     focusClassSyncCleanup: null,
+    domBlockFillCleanup: null,
     terminalScrollIntentDisposable: null,
+    mouseEncodingTrackerDisposable,
     linkifierMouseLeaveResetDisposable: null,
     arabicShapingJoinerCleanup: null,
     pendingSplitScrollState: null,

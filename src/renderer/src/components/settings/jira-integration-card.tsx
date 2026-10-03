@@ -1,3 +1,4 @@
+import { UnsealedCredentialNotice } from './UnsealedCredentialNotice'
 import { useState } from 'react'
 import { AlertCircle, CheckCircle2, LoaderCircle, Unlink } from 'lucide-react'
 import { JiraConnectDialog } from '@/components/jira-connect-dialog'
@@ -99,7 +100,14 @@ export function JiraIntegrationCard(): React.JSX.Element {
       }
       checking={checking}
       statusTone={connected ? 'connected' : 'attention'}
-      statusLabel={connected ? 'Connected' : 'Not connected'}
+      statusLabel={
+        connected
+          ? translate('auto.components.settings.jira.integration.card.statusConnected', 'Connected')
+          : translate(
+              'auto.components.settings.jira.integration.card.statusNotConnected',
+              'Not connected'
+            )
+      }
       actions={
         !checking ? (
           <Button
@@ -121,6 +129,13 @@ export function JiraIntegrationCard(): React.JSX.Element {
       }
     >
       <IntegrationCardDetails>
+        <UnsealedCredentialNotice
+          protection={jiraStatus.credentialProtection ?? null}
+          credentialName={translate(
+            'auto.components.settings.jira.integration.card.jiraTokenName',
+            'Your Jira API token'
+          )}
+        />
         <ProviderHostScopeControl
           labelPrefix={translate(
             'auto.components.settings.task.tracker.integration.cards.account_scope_prefix',

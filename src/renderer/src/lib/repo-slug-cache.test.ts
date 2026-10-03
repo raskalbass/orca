@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest'
-import type { Repo } from '../../../shared/types'
-import { githubRepoIdentityKey } from '../../../shared/github-repository-identity-key'
+import type { Repo } from '../../../shared/repo-types'
+import { githubRepoIdentityKey } from '../../../shared/github/repository-identity-key'
 import {
   REPO_SLUG_FAILURE_TTL_MS,
   clearRepoSlugCacheValues,
@@ -44,6 +44,14 @@ describe('repo slug cache host identity', () => {
     expect(
       lookupReposBySlugFromCache([dotCom, enterprise], null, 'acme/widgets', 'ghe.example:8443')
     ).toEqual([enterprise])
+  })
+
+  it('drops the fork alias while its own origin is unresolved', () => {
+    const fork = { ...repo('fork'), upstream: { owner: 'acme', repo: 'widgets' } }
+
+    expect(lookupReposBySlugFromCache([fork], null, 'acme/widgets')).toEqual([])
+    slugByRepoId.set(slugCacheKey(fork.id, settingsForRepoOwner(fork, null)), null)
+    expect(lookupReposBySlugFromCache([fork], null, 'acme/widgets')).toEqual([])
   })
 
   it('expires negative slug resolutions so an external GHES login can recover', () => {

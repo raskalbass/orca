@@ -5,12 +5,13 @@ import { pathToFileURL } from 'node:url'
 import { app, BrowserWindow, dialog, ipcMain, type IpcMainInvokeEvent } from 'electron'
 import { is } from '@electron-toolkit/utils'
 import type { AppIdentity } from '../../shared/app-identity'
-import type { FloatingTerminalCwdRequest, MarkdownDocument } from '../../shared/types'
+import type { MarkdownDocument } from '../../shared/filesystem-entry-types'
+import type { FloatingTerminalCwdRequest } from '../../shared/ui-chrome-types'
 import { relaunchApp } from '../app-relaunch'
 import type { Store } from '../persistence'
 import { getDevInstanceIdentity } from '../startup/dev-instance-identity'
-import { isPwshAvailable } from '../pwsh'
-import { isWslAvailable, listWslDistros } from '../wsl'
+import { isPwshAvailableAsync } from '../pwsh'
+import { isWslAvailableAsync, listWslDistrosAsync } from '../wsl'
 import { isGitBashAvailable } from '../git-bash'
 import { setUnreadDockBadgeCount } from '../dock/unread-badge'
 import { destroySystemTray } from '../tray/system-tray'
@@ -21,7 +22,10 @@ import {
   resolveFloatingTerminalCwd
 } from './floating-workspace-directory'
 import { isMarkdownDocumentName, markdownDocumentFromFilePath } from './markdown-documents'
+import { registerMacSymbolicHotkeysProbeHandler } from './macos-symbolic-hotkeys-probe'
 import { registerRendererShutdownCheckpointHandler } from './renderer-shutdown-checkpoint'
+import { readMacKeyboardLayoutSnapshot } from './macos-keyboard-layout-snapshot'
+import { registerMacKeyboardLayoutChangeNotifications } from './macos-keyboard-layout-change-notifications'
 
 const KEYBOARD_INPUT_SOURCE_TIMEOUT_MS = 500
 const MAC_HITOOLBOX_DOMAIN = 'com.apple.HIToolbox'
@@ -179,7 +183,9 @@ function readCommandStdout(
   })
 }
 
-function readSelectedInputSourceIdFromJson(stdout: string): string | null {
+type SelectedKeyboardInputSource = { kind: 'inputSource'; id: string } | { kind: 'keyboardLayout' }
+
+function readSelectedInputSourceFromJson(stdout: string): SelectedKeyboardInputSource | null {
   let records: unknown
   try {
     records = JSON.parse(stdout)
@@ -190,58 +196,67 @@ function readSelectedInputSourceIdFromJson(stdout: string): string | null {
     return null
   }
 
+  let hasSelectedKeyboardLayout = false
   for (const record of records.slice().toReversed()) {
     if (!record || typeof record !== 'object') {
       continue
     }
-    const fields = record as Record<string, unknown>
-    const kind = typeof fields.InputSourceKind === 'string' ? fields.InputSourceKind : ''
-    if (kind.toLowerCase().includes('non keyboard')) {
+    const kind =
+      'InputSourceKind' in record && typeof record.InputSourceKind === 'string'
+        ? record.InputSourceKind.trim().toLowerCase()
+        : ''
+    if (kind === 'keyboard layout') {
+      hasSelectedKeyboardLayout = true
       continue
     }
-    const inputMode = fields['Input Mode']
-    if (typeof inputMode === 'string' && inputMode.trim()) {
-      return inputMode.trim()
+    if (kind.includes('non keyboard')) {
+      continue
     }
-    const bundleId = fields['Bundle ID']
-    if (typeof bundleId === 'string' && bundleId.trim()) {
-      return bundleId.trim()
+    if (kind !== 'input mode' && kind !== 'keyboard input method') {
+      return null
     }
+    const inputMode = 'Input Mode' in record ? record['Input Mode'] : undefined
+    const bundleId = 'Bundle ID' in record ? record['Bundle ID'] : undefined
+    const id = typeof inputMode === 'string' && inputMode.trim() ? inputMode : bundleId
+    if (typeof id === 'string' && id.trim()) {
+      return { kind: 'inputSource', id: id.trim() }
+    }
+    return null
   }
-  return null
+  return hasSelectedKeyboardLayout ? { kind: 'keyboardLayout' } : null
 }
 
-async function readSelectedKeyboardInputSourceId(): Promise<string | null> {
+async function readSelectedKeyboardInputSource(): Promise<SelectedKeyboardInputSource | null> {
   try {
     const stdout = await readCommandStdout(
       '/bin/sh',
       ['-c', MAC_SELECTED_INPUT_SOURCES_JSON_COMMAND],
       'Selected keyboard input source probe timed out'
     )
-    return readSelectedInputSourceIdFromJson(stdout)
+    return readSelectedInputSourceFromJson(stdout)
   } catch {
     return null
   }
 }
 
-function readKeyboardLayoutInputSourceId(): Promise<string> {
-  return readCommandStdout(
-    '/usr/bin/defaults',
-    ['read', MAC_HITOOLBOX_DOMAIN, 'AppleCurrentKeyboardLayoutInputSourceID'],
-    'Keyboard layout input source probe timed out'
-  )
-}
-
 async function readKeyboardInputSourceId(): Promise<string | null> {
-  const selectedInputSourceId = await readSelectedKeyboardInputSourceId()
-  if (selectedInputSourceId) {
-    return selectedInputSourceId
+  const selectedInputSource = await readSelectedKeyboardInputSource()
+  if (selectedInputSource?.kind === 'inputSource') {
+    return selectedInputSource.id
   }
-  return readKeyboardLayoutInputSourceId()
+  // An IME can use ABC underneath; the backing layout alone cannot identify the selected source.
+  return selectedInputSource?.kind === 'keyboardLayout'
+    ? readCommandStdout(
+        '/usr/bin/defaults',
+        ['read', MAC_HITOOLBOX_DOMAIN, 'AppleCurrentKeyboardLayoutInputSourceID'],
+        'Keyboard layout input source probe timed out'
+      )
+    : null
 }
 
 export function registerAppHandlers(store: Store, options: RegisterAppHandlersOptions = {}): void {
   registerRendererShutdownCheckpointHandler(store)
+  registerMacKeyboardLayoutChangeNotifications()
 
   ipcMain.handle('app:getFeatureWallAssetBaseUrl', (): string => getFeatureWallAssetBaseUrl())
 
@@ -258,12 +273,14 @@ export function registerAppHandlers(store: Store, options: RegisterAppHandlersOp
     }
   })
 
-  ipcMain.handle('wsl:isAvailable', (): boolean => isWslAvailable())
-  ipcMain.handle('wsl:listDistros', (): string[] => listWslDistros())
-  ipcMain.handle('pwsh:isAvailable', (): boolean => isPwshAvailable())
+  // Why: these probes spawn wsl.exe/pwsh.exe; the sync variants would block the main event
+  // loop — every PTY message, window IPC and watchdog beat — for up to 5s per renderer read.
+  ipcMain.handle('wsl:isAvailable', (): Promise<boolean> => isWslAvailableAsync())
+  ipcMain.handle('wsl:listDistros', (): Promise<string[]> => listWslDistrosAsync())
+  ipcMain.handle('pwsh:isAvailable', (): Promise<boolean> => isPwshAvailableAsync())
   ipcMain.handle('gitBash:isAvailable', (): boolean => isGitBashAvailable())
 
-  // Why: renderer layout fingerprint tags ABC/CJK-Roman as 'us', breaking Option+letter (#1205); HIToolbox prefs override it.
+  // The selected IME identity must win over its US-shaped backing keyboard layout.
   ipcMain.handle('app:getKeyboardInputSourceId', async (): Promise<string | null> => {
     if (process.platform !== 'darwin') {
       return null
@@ -274,10 +291,12 @@ export function registerAppHandlers(store: Store, options: RegisterAppHandlersOp
       const trimmed = stdout?.trim() ?? ''
       return trimmed.length > 0 ? trimmed : null
     } catch {
-      // Why: probe can fail (missing keys on first boot, sandbox) — treat as "no signal" and fall back to the fingerprint.
+      // A failed probe must not promote an IME's backing layout into an Alt default.
       return null
     }
   })
+
+  ipcMain.handle('app:getKeyboardLayoutSnapshot', () => readMacKeyboardLayoutSnapshot())
 
   ipcMain.handle('app:relaunch', async () => {
     // Why: brief delay lets the renderer paint "Restarting…" before the window tears down.
@@ -298,6 +317,8 @@ export function registerAppHandlers(store: Store, options: RegisterAppHandlersOp
       app.quit()
     }, 150)
   })
+
+  registerMacSymbolicHotkeysProbeHandler(readCommandStdout)
 
   ipcMain.handle('app:setUnreadDockBadgeCount', (_event, count: number) => {
     setUnreadDockBadgeCount(Number.isFinite(count) ? count : 0)

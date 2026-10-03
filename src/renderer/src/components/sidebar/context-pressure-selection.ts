@@ -3,13 +3,13 @@ import { useShallow } from 'zustand/react/shallow'
 import { useAppStore } from '@/store'
 import type { AppState } from '@/store/types'
 import type { AgentStatusEntry } from '../../../../shared/agent-status-types'
-import type { GlobalSettings } from '../../../../shared/types'
 import {
   resolveContextPressure,
   resolveContextPressureConfigFromSettings,
   type ContextPressureConfig,
   type ContextPressureLevel,
   type ContextPressureLimitSource,
+  type ContextPressureSettings,
   type ContextPressureSnapshot
 } from '../../../../shared/agent-context-pressure'
 import { parsePaneKey } from '../../../../shared/stable-pane-id'
@@ -20,14 +20,6 @@ import { selectLiveAgentStatusEntriesForWorktree } from './worktree-agent-row-se
 // experimental context-pressure indicator. Everything here returns null when
 // the master flag is off or a session has no provider-reported usage — the UI
 // renders NOTHING for unknowns, never an invented value.
-
-type ContextPressureSettings = Pick<
-  GlobalSettings,
-  | 'experimentalContextPressure'
-  | 'contextPressureWarnPercent'
-  | 'contextPressureCriticalPercent'
-  | 'contextPressureSoftLimits'
->
 
 type ConfigCache = {
   warnPercent: number

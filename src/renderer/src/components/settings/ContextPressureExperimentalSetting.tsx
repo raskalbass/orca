@@ -1,4 +1,4 @@
-import type { GlobalSettings } from '../../../../shared/types'
+import type { GlobalSettings } from '../../../../shared/global-settings-types'
 import {
   DEFAULT_CONTEXT_PRESSURE_CRITICAL_PERCENT,
   DEFAULT_CONTEXT_PRESSURE_WARN_PERCENT,

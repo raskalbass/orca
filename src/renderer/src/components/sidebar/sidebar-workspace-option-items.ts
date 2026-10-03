@@ -1,6 +1,10 @@
-import type { AgentActivityDisplayMode, WorktreeCardProperty } from '../../../../shared/types'
+import type {
+  AgentActivityDisplayMode,
+  WorktreeCardProperty
+} from '../../../../shared/ui-chrome-types'
 import { TASK_WORKTREE_CARD_PROPERTIES } from '../../../../shared/constants'
 import { translate } from '@/i18n/i18n'
+import { CONTEXT_PRESSURE_WORKTREE_CARD_PROPERTY_OPTION } from './sidebar-workspace-option-context-pressure'
 
 export const GROUP_BY_OPTIONS = [
   {
@@ -121,6 +125,13 @@ const BASE_WORKTREE_CARD_PROPERTY_OPTIONS: WorktreeCardPropertyOption[] = [
     }
   },
   {
+    id: 'host',
+    properties: ['host'],
+    get label() {
+      return translate('auto.components.sidebar.SidebarWorkspaceOptionsMenu.host', 'Host')
+    }
+  },
+  {
     id: 'branch',
     properties: ['branch'],
     get label() {
@@ -173,19 +184,6 @@ const ISSUE_WORKTREE_CARD_PROPERTY_OPTIONS: WorktreeCardPropertyOption[] = [
   }
 ]
 
-// Why gated: the property renders nothing while experimentalContextPressure is
-// off, and a checkbox with no visible effect reads as broken.
-const CONTEXT_PRESSURE_WORKTREE_CARD_PROPERTY_OPTION: WorktreeCardPropertyOption = {
-  id: 'context-pressure',
-  properties: ['context-pressure'],
-  get label() {
-    return translate(
-      'auto.components.sidebar.SidebarWorkspaceOptionsMenu.contextPressure',
-      'Context pressure'
-    )
-  }
-}
-
 type WorktreeCardPropertyOptionsInput = {
   newCardStyle?: boolean
   hasProjectGroups?: boolean
@@ -231,8 +229,6 @@ export function getWorktreeCardPropertyOptions({
     ...trailingOptions
   ]
 }
-
-export const WORKTREE_CARD_PROPERTY_OPTIONS = getWorktreeCardPropertyOptions()
 
 export const SORT_OPTIONS = [
   {

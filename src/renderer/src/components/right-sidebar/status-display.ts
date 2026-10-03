@@ -1,4 +1,4 @@
-import type { GitFileStatus, GitStatusEntry } from '../../../../shared/types'
+import type { GitFileStatus, GitStatusEntry } from '../../../../shared/git-status-types'
 import { joinPath, normalizeRelativePath } from '@/lib/path'
 import { splitPathSegments } from './path-tree'
 
@@ -44,7 +44,7 @@ export function getDominantStatus(statuses: Iterable<GitFileStatus>): GitFileSta
   return dominantStatus
 }
 
-export function buildStatusMap(entries: GitStatusEntry[]): Map<string, GitFileStatus> {
+export function buildStatusMap(entries: readonly GitStatusEntry[]): Map<string, GitFileStatus> {
   const statusByPath = new Map<string, GitFileStatus>()
 
   for (const entry of entries) {

@@ -41,6 +41,8 @@ const { SshRelaySession } = await import('./ssh-relay-session')
 const SSH_LEAF_ID = '11111111-1111-4111-8111-111111111111'
 const REPLAY_LEAF_ID = '22222222-2222-4222-8222-222222222222'
 const BAD_LEAF_ID = '33333333-3333-4333-8333-333333333333'
+const COMPACT_PROMPT_ID = '44444444-4444-4444-8444-444444444444'
+const PREVIOUS_PROMPT_ID = '55555555-5555-4555-8555-555555555555'
 
 type CapturedStatus = {
   paneKey: string
@@ -49,6 +51,7 @@ type CapturedStatus = {
   connectionId: string | null
   payload: {
     state: string
+    workingMode?: 'monitoring'
     prompt: string
     agentType?: string
     toolName?: string
@@ -112,6 +115,7 @@ function createFakeRelay(): FakeRelay {
         ? (params.resume as { ownerGeneration: number }).ownerGeneration + 1
         : 1,
     ownerLease: 'test-owner-lease',
+    resumed: params.resume !== undefined,
     capabilities: {
       outputFlowControl: { version: 1, windowSu: DEFAULT_PTY_SOURCE_WINDOW_SU }
     }
@@ -155,7 +159,9 @@ function createFakeRelay(): FakeRelay {
 
 type ContextPressureSettingsHarness = {
   enabled: boolean
-  listener?: (updates: Record<string, unknown>, settings: Record<string, unknown>) => void
+  // The session binds more than one settings listener (context pressure + plugin
+  // settings); collect them all so a fake settings change reaches every subscriber.
+  listeners: ((updates: Record<string, unknown>, settings: Record<string, unknown>) => void)[]
 }
 
 function createSession(
@@ -168,13 +174,21 @@ function createSession(
     upsertSshPtyConsumerRecovery: vi.fn(),
     removeSshPtyConsumerRecovery: vi.fn(),
     getSshRemotePtyLeases: vi.fn().mockReturnValue([]),
+    reconcileSshRemotePtyLeasesForTarget: vi.fn(),
     markSshRemotePtyLease: vi.fn(),
     markSshRemotePtyLeases: vi.fn(),
+    markSshRemotePtyLeasesAsync: vi.fn(),
+    markSshRemotePtyLeasesAttachedAsync: vi.fn(),
+    getSshRemotePtyKillIntents: vi.fn().mockReturnValue([]),
+    pruneExpiredSshRemotePtyKillIntents: vi.fn(),
+    recordSshRemotePtyKillIntent: vi.fn(),
+    clearSshRemotePtyKillIntent: vi.fn(),
+    noteSshRemotePtyKillReplayAttempt: vi.fn(),
     ...(contextPressure
       ? {
           getSettings: vi.fn(() => ({ experimentalContextPressure: contextPressure.enabled })),
           onSettingsChanged: vi.fn((listener) => {
-            contextPressure.listener = listener
+            contextPressure.listeners.push(listener)
             return vi.fn()
           })
         }
@@ -203,6 +217,7 @@ function captureAgentStatuses(events: CapturedStatus[]): void {
       connectionId: event.connectionId,
       payload: {
         state: event.payload.state,
+        ...(event.payload.workingMode ? { workingMode: event.payload.workingMode } : {}),
         prompt: event.payload.prompt,
         agentType: event.payload.agentType,
         toolName: event.payload.toolName
@@ -248,7 +263,7 @@ describe('SshRelaySession agent hooks over a fake relay transport', () => {
   })
 
   it('synchronizes context-pressure settings to the remote relay live', async () => {
-    const settings: ContextPressureSettingsHarness = { enabled: false }
+    const settings: ContextPressureSettingsHarness = { enabled: false, listeners: [] }
     relay = createFakeRelay()
     vi.mocked(deployAndLaunchRelay).mockResolvedValue({
       transport: relay.transport,
@@ -258,10 +273,12 @@ describe('SshRelaySession agent hooks over a fake relay transport', () => {
     await session.establish({} as SshConnection)
     await vi.waitFor(() => expect(relay?.contextPressureSettings).toEqual([false]))
     settings.enabled = true
-    settings.listener?.(
-      { experimentalContextPressure: true },
-      { experimentalContextPressure: true }
-    )
+    for (const listener of settings.listeners) {
+      listener(
+        { experimentalContextPressure: true },
+        { experimentalContextPressure: true }
+      )
+    }
     await vi.waitFor(() => expect(relay?.contextPressureSettings).toEqual([false, true]))
   })
 
@@ -335,7 +352,146 @@ describe('SshRelaySession agent hooks over a fake relay transport', () => {
     })
   })
 
-  it('clears stamped status on reconnect loss but not final shutdown', async () => {
+  it('preserves tmux evidence age and unavailable across the real notification adapter', async () => {
+    relay = createFakeRelay()
+    vi.mocked(deployAndLaunchRelay).mockResolvedValue({
+      transport: relay.transport,
+      serverBuildId: 'test-relay-build',
+      platform: 'linux-x64'
+    })
+    const events: CapturedStatus[] = []
+    captureAgentStatuses(events)
+    session = createSession('conn-tmux')
+    // oxlint-disable-next-line typescript/consistent-type-assertions -- SAFETY: Mocked deployment never reads the connection.
+    await session.establish({} as SshConnection)
+    const envelope = makeEnvelope({
+      source: 'opencode',
+      evidenceAgeMs: 60_000,
+      payload: { state: 'done', prompt: 'older inner turn', agentType: 'opencode' }
+    })
+    const before = Date.now()
+    relay.notifyAgentHook(envelope)
+    await waitForStatusCount(events, 1)
+    const row = agentHookServer
+      .getStatusSnapshot()
+      .find((entry) => entry.paneKey === envelope.paneKey)
+    expect(row?.evidenceObservedAt).toBeGreaterThanOrEqual(before - 60_000)
+    expect(row?.evidenceObservedAt).toBeLessThanOrEqual(Date.now() - 60_000)
+    relay.notifyAgentHook({ ...envelope, statusUnavailable: true, payload: null })
+    await vi.waitFor(() =>
+      expect(
+        agentHookServer.getStatusSnapshot().find((entry) => entry.paneKey === envelope.paneKey)
+      ).toBeUndefined()
+    )
+  })
+
+  it('preserves Claude monitoring mode across the SSH relay boundary', async () => {
+    relay = createFakeRelay()
+    vi.mocked(deployAndLaunchRelay).mockResolvedValue({
+      transport: relay.transport,
+      serverBuildId: 'test-relay-build',
+      platform: 'linux-x64'
+    })
+    const events: CapturedStatus[] = []
+    captureAgentStatuses(events)
+    session = createSession('conn-monitoring')
+    await session.establish({} as SshConnection)
+
+    relay.notifyAgentHook(
+      makeEnvelope({
+        source: 'claude',
+        claudeRunningNonAgentTask: true,
+        payload: {
+          state: 'working',
+          workingMode: 'monitoring',
+          prompt: 'watch the build',
+          agentType: 'claude'
+        }
+      })
+    )
+
+    await waitForStatusCount(events, 1)
+    expect(events[0]).toMatchObject({
+      connectionId: 'conn-monitoring',
+      payload: { state: 'working', workingMode: 'monitoring', agentType: 'claude' }
+    })
+    expect(agentHookServer.getStatusSnapshot()[0]).toMatchObject({
+      state: 'working',
+      workingMode: 'monitoring'
+    })
+  })
+
+  it('stamps SSH ownership and settles only the exact manual compact identity', async () => {
+    relay = createFakeRelay()
+    vi.mocked(deployAndLaunchRelay).mockResolvedValue({
+      transport: relay.transport,
+      serverBuildId: 'test-relay-build',
+      platform: 'linux-x64'
+    })
+    const events: CapturedStatus[] = []
+    captureAgentStatuses(events)
+    session = createSession('conn-compact')
+    await session.establish({} as SshConnection)
+
+    const compactEnvelope = (
+      hookEventName: 'UserPromptSubmit' | 'PreCompact' | 'PostCompact',
+      state: 'working' | 'done'
+    ): AgentHookRelayEnvelope =>
+      makeEnvelope({
+        source: 'claude',
+        hookEventName,
+        providerPromptId:
+          hookEventName === 'UserPromptSubmit' ? PREVIOUS_PROMPT_ID : COMPACT_PROMPT_ID,
+        compactTrigger: hookEventName === 'UserPromptSubmit' ? undefined : 'manual',
+        providerSession: { key: 'session_id', id: 'claude-session' },
+        hasExplicitPrompt: hookEventName === 'UserPromptSubmit' ? true : undefined,
+        payload: {
+          state,
+          prompt: 'work before compact',
+          agentType: 'claude'
+        }
+      })
+
+    relay.notifyAgentHook(compactEnvelope('UserPromptSubmit', 'working'))
+    await waitForStatusCount(events, 1)
+
+    // Why: PreCompact fires before the compact is validated, so it may never move the pane —
+    // over SSH just as locally.
+    relay.notifyAgentHook(compactEnvelope('PreCompact', 'working'))
+    await new Promise((resolve) => setImmediate(resolve))
+    expect(events).toHaveLength(1)
+
+    relay.notifyAgentHook({
+      ...compactEnvelope('PostCompact', 'done'),
+      providerPromptId: undefined
+    })
+    await new Promise((resolve) => setImmediate(resolve))
+    expect(events).toHaveLength(1)
+
+    relay.notifyAgentHook(compactEnvelope('PostCompact', 'done'))
+    await waitForStatusCount(events, 2)
+
+    expect(events.at(-1)).toMatchObject({
+      connectionId: 'conn-compact',
+      payload: { state: 'done', prompt: 'work before compact', agentType: 'claude' }
+    })
+    expect(
+      agentHookServer._getStateForTests().lastStatusByPaneKey.values().next().value
+    ).toMatchObject({
+      source: 'claude',
+      providerPromptId: COMPACT_PROMPT_ID,
+      connectionId: 'conn-compact',
+      // Why: a compact that finished must not read as a completed turn to notification and
+      // automation consumers, over SSH just as locally.
+      payload: { sessionBoundary: true }
+    })
+
+    relay.notifyAgentHook(compactEnvelope('PostCompact', 'done'))
+    await new Promise((resolve) => setImmediate(resolve))
+    expect(events).toHaveLength(2)
+  })
+
+  it('keeps stamped status unverifiable across reconnect loss and final shutdown', async () => {
     const initialRelay = createFakeRelay()
     relay = createFakeRelay()
     vi.mocked(deployAndLaunchRelay)
@@ -359,16 +515,13 @@ describe('SshRelaySession agent hooks over a fake relay transport', () => {
     await session.reconnect({} as SshConnection)
     initialRelay.dispose()
 
-    expect(agentHookServer.getStatusSnapshot()).toEqual([])
-    expect(clearListener).toHaveBeenCalledOnce()
-    expect(clearListener).toHaveBeenCalledWith({
-      transient: true,
-      connectionId: 'conn-clear',
-      clearedAt: expect.any(Number)
-    })
+    expect(agentHookServer.getStatusSnapshot()).toEqual([
+      expect.objectContaining({ connectionId: 'conn-clear', state: 'working' })
+    ])
+    expect(clearListener).not.toHaveBeenCalled()
     session.dispose()
     session = null
-    expect(clearListener).toHaveBeenCalledOnce()
+    expect(clearListener).not.toHaveBeenCalled()
   })
 
   it('asks the fake relay for cached hook replay after the session wires its listener', async () => {
@@ -522,7 +675,9 @@ describe('SshRelaySession agent hooks over a fake relay transport', () => {
         promptInteractionKey: 'command-code-transcript-user-3',
         toolUseId: 'toolu-1',
         toolAgentId: 'agent-subagent-a',
+        teammateName: 'reviewer',
         toolAgentType: 'Review',
+        claudeRunningNonAgentTask: true,
         providerSessionOnly: true,
         providerSession: {
           key: 'session_id',
@@ -544,7 +699,9 @@ describe('SshRelaySession agent hooks over a fake relay transport', () => {
           promptInteractionKey: 'command-code-transcript-user-3',
           toolUseId: 'toolu-1',
           toolAgentId: 'agent-subagent-a',
+          teammateName: 'reviewer',
           toolAgentType: 'Review',
+          claudeRunningNonAgentTask: true,
           providerSessionOnly: true,
           providerSession: {
             key: 'session_id',
@@ -605,6 +762,31 @@ describe('SshRelaySession agent hooks over a fake relay transport', () => {
     await new Promise((resolve) => setImmediate(resolve))
     expect(trackMock).not.toHaveBeenCalledWith('agent_prompt_sent', expect.anything())
   })
+
+  it.each([{ isReplay: 'true' }, { isReplay: null }, { launchToken: 42 }])(
+    'rejects malformed OMP authority metadata before forwarding: %j',
+    async (invalid) => {
+      relay = createFakeRelay()
+      vi.mocked(deployAndLaunchRelay).mockResolvedValue({
+        transport: relay.transport,
+        serverBuildId: 'test-relay-build',
+        platform: 'linux-x64'
+      })
+      session = createSession('conn-omp-invalid')
+      await session.establish({} as SshConnection)
+      const ingestSpy = vi.spyOn(agentHookServer, 'ingestRemote')
+      const envelope = makeEnvelope({
+        source: 'omp',
+        hookEventName: 'before_agent_start',
+        payload: { agentType: 'omp', state: 'working', prompt: 'new turn' }
+      })
+      relay.notifyAgentHook(JSON.parse(JSON.stringify({ ...envelope, ...invalid })))
+      await new Promise((resolve) => setImmediate(resolve))
+      await new Promise((resolve) => setImmediate(resolve))
+      expect(ingestSpy).not.toHaveBeenCalled()
+      ingestSpy.mockRestore()
+    }
+  )
 
   it('preserves replay metadata from remote hook notifications', async () => {
     relay = createFakeRelay()

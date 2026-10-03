@@ -12,7 +12,9 @@ export function dashboardBucketForState(state: DashboardAgentRow['state']): Dash
       return 'working'
     case 'done':
       return 'done'
+    // 'unverifiable' is renderer-local decay; it publishes as 'idle' like dashboardCardDotState.
     case 'idle':
+    case 'unverifiable':
       return 'idle'
     // blocked | waiting — the agent needs the user.
     case 'blocked':

@@ -1,3 +1,4 @@
+import type { AgentProcessPresence } from './agent-process-presence'
 // Why: defines the wire shape carried by the JSON-RPC `agent.hook` notification
 // the relay sends to Orca. Consumed by `src/relay/agent-hook-server.ts` (which
 // produces it after the shared listener parses an HTTP POST) and by
@@ -8,7 +9,7 @@
 // the renderer-bound IPC + installer contract; this module is the wire envelope
 // between Orca's main process and the remote relay.
 //
-// Per the design doc:
+// Invariants both ends rely on:
 // - The relay normalizes; Orca routes. The envelope's `payload` field has
 //   already been through `normalizeHookPayload` (which calls
 //   `parseAgentStatusPayload` → `normalizeAgentStatusObject`) on the relay
@@ -22,7 +23,9 @@
 //   POST body so Orca's warn-once protocol diagnostics still fire. The relay
 //   default env is `remote`, a location marker ignored by dev-vs-prod checks.
 
-import type { ParsedAgentStatusPayload } from './agent-status-types'
+import { createHash } from 'node:crypto'
+
+import type { AgentSubagentSnapshot, ParsedAgentStatusPayload } from './agent-status-types'
 import type { AgentContextUsage } from './agent-context-pressure'
 import type { AgentProviderSessionMetadata } from './agent-session-resume'
 import type { AgentHookTarget } from './agent-hook-types'
@@ -33,24 +36,43 @@ import type { AgentHookTarget } from './agent-hook-types'
 // Promoted from `src/main/agent-hooks/server.ts` so the relay can import it
 // without dragging Electron in (the shared listener module is the only place
 // that consumes it from the relay side).
-export type AgentHookSource =
-  | 'claude'
-  | 'codex'
-  | 'gemini'
-  | 'antigravity'
-  | 'amp'
-  | 'opencode'
-  | 'mimo-code'
-  | 'cursor'
-  | 'pi'
-  | 'omp'
-  | 'droid'
-  | 'command-code'
-  | 'grok'
-  | 'copilot'
-  | 'hermes'
-  | 'devin'
-  | 'kimi'
+const AGENT_HOOK_SOURCES = [
+  'claude',
+  'codex',
+  'qoder',
+  'qoder-cn',
+  'qwen-code',
+  'codebuddy',
+  'gemini',
+  'antigravity',
+  'amp',
+  'opencode',
+  'opencode2',
+  'mimo-code',
+  'cursor',
+  'pi',
+  'omp',
+  'prime-agent',
+  'droid',
+  'command-code',
+  'grok',
+  'copilot',
+  'hermes',
+  'devin',
+  'kimi',
+  'muse',
+  'zcode',
+  'dsh',
+  'jcode'
+] as const
+
+export type AgentHookSource = (typeof AGENT_HOOK_SOURCES)[number]
+
+const AGENT_HOOK_SOURCE_SET: ReadonlySet<string> = new Set(AGENT_HOOK_SOURCES)
+
+export function isAgentHookSource(value: unknown): value is AgentHookSource {
+  return typeof value === 'string' && AGENT_HOOK_SOURCE_SET.has(value)
+}
 
 /** Env marker used by the remote relay. It is a transport/location marker, not
  *  a dev-vs-prod build tag, so main-process env mismatch diagnostics ignore it. */
@@ -60,6 +82,7 @@ export const REMOTE_AGENT_HOOK_ENV = 'remote' as const
 export type AgentHookRelayEnvelope = {
   source: AgentHookSource
   paneKey: string
+  agentPresence?: AgentProcessPresence
   /** Ephemeral Orca launch identity stamped into the PTY env for this process. */
   launchToken?: string
   tabId?: string
@@ -74,10 +97,18 @@ export type AgentHookRelayEnvelope = {
   promptInteractionKey?: string
   /** Hook discriminator preserved for main-process transition rules. */
   hookEventName?: string
+  /** Provider-owned turn identity (Claude UUID or opaque Grok prompt id). */
+  providerPromptId?: string
+  /** The row belongs to an observed Grok prompt boundary whose opaque id may be absent. */
+  grokPromptBoundary?: true
+  /** Active Claude compact generation, keyed by provider prompt identity. */
+  compactTrigger?: 'manual' | 'auto'
   /** Claude tool execution id, when the source hook provides one. */
   toolUseId?: string
   /** Claude subagent identity, when the source hook provides one. */
   toolAgentId?: string
+  /** Claude teammate name carried by TeammateIdle. */
+  teammateName?: string
   /** Claude agent type, used only as a lower-confidence identity fallback. */
   toolAgentType?: string
   /** Provider-owned conversation/session id needed to resume a sleeping agent. */
@@ -86,6 +117,8 @@ export type AgentHookRelayEnvelope = {
   providerSessionOnly?: boolean
   /** True when the relay is replaying its cache after Orca reconnects. */
   isReplay?: boolean
+  /** Claude background-work evidence for input-interrupt inference on the receiving host. */
+  claudeRunningNonAgentTask?: boolean
   /** Forwarded from the agent CLI POST body. The relay default is `remote`,
    *  which marks transport location rather than dev/prod build env. */
   env?: string
@@ -93,19 +126,110 @@ export type AgentHookRelayEnvelope = {
    *  protocol-version diagnostic fire on remote events the same as on local. */
   version?: string
   /** Pre-normalized status payload from the relay's `normalizeHookPayload`.
-   *  Orca's `ingestRemote` validates it again at the SSH trust boundary. */
+   *  Orca's `ingestRemote` validates it again at the SSH trust boundary.
+   *  Absent on context-only readings (`contextUsage` envelopes). */
+  evidenceAgeMs?: number
   payload?: ParsedAgentStatusPayload
   /** Normalized context-only reading from a remote statusline. */
   contextUsage?: AgentContextUsage | null
   contextSessionId?: string
 }
 
+/** Older clients ignore the null payload; newer clients clear only the selected projection. */
+export type AgentHookUnavailableEnvelope = {
+  source: 'opencode' | 'opencode2'
+  paneKey: string
+  tabId?: string
+  worktreeId?: string
+  launchToken?: string
+  connectionId: null
+  statusUnavailable: true
+  payload: null
+}
+
 /** JSON-RPC notification method name carried over the relay control channel. */
 export const AGENT_HOOK_NOTIFICATION_METHOD = 'agent.hook' as const
 
+/** Identifies optional payload fields the relay dropped to fit an oversized frame
+ *  (see `src/relay/agent-hook-envelope-publication.ts`), so `ingestRemote` can tell
+ *  "shed in transit" from "the agent cleared it"; rosters include their digest. */
+export const AGENT_HOOK_SHED_FIELDS_KEY = 'shedFields' as const
+const AGENT_HOOK_SHED_SUBAGENTS_DIGEST_PREFIX = 'subagents:sha256:'
+
+function subagentRosterDigest(subagents: readonly AgentSubagentSnapshot[]): string {
+  const stableRoster = subagents.map(({ id, state, startedAt, agentType, model, description }) => [
+    id,
+    state,
+    startedAt,
+    agentType ?? null,
+    model ?? null,
+    description ?? null
+  ])
+  return createHash('sha256').update(JSON.stringify(stableRoster)).digest('base64url')
+}
+
+/** Carries the dropped roster identity without carrying its full rows. */
+export function createShedSubagentsField(subagents: readonly AgentSubagentSnapshot[]): string {
+  return `${AGENT_HOOK_SHED_SUBAGENTS_DIGEST_PREFIX}${subagentRosterDigest(subagents)}`
+}
+
+function hasMatchingShedSubagentsField(
+  shedFields: readonly unknown[],
+  previous: ParsedAgentStatusPayload
+): boolean {
+  if (!previous.subagents) {
+    return false
+  }
+  const expected = createShedSubagentsField(previous.subagents)
+  return shedFields.some((field) => field === expected)
+}
+
+function hasMatchingTurnIdentity(
+  payload: ParsedAgentStatusPayload,
+  previous: ParsedAgentStatusPayload
+): boolean {
+  return (
+    payload.prompt === previous.prompt &&
+    payload.agentType === previous.agentType &&
+    payload.model === previous.model
+  )
+}
+
+/**
+ * Re-attaches shed fields from Orca's cached payload for this pane, so a transport-level
+ * truncation cannot read as a cleared field — an absent `subagents` blanks live child rows and
+ * unblocks hibernation for a pane whose teammates are still running.
+ *
+ * `interactivePrompt` and `lastAssistantMessage` are deliberately not restored: cached prose can
+ * belong to an earlier turn. A roster returns only when its wire digest and turn identity match.
+ */
+export function restoreShedStatusFields(
+  payload: ParsedAgentStatusPayload,
+  shedFields: unknown,
+  previous: ParsedAgentStatusPayload | undefined
+): ParsedAgentStatusPayload {
+  if (!previous || !Array.isArray(shedFields) || shedFields.length === 0) {
+    return payload
+  }
+  const subagents =
+    payload.subagents === undefined &&
+    hasMatchingTurnIdentity(payload, previous) &&
+    hasMatchingShedSubagentsField(shedFields, previous)
+      ? previous.subagents
+      : undefined
+  if (subagents === undefined) {
+    return payload
+  }
+  return {
+    ...payload,
+    subagents
+  }
+}
+
 /** JSON-RPC request method Orca issues after `--connect` reattach to ask the
- *  relay to replay its per-paneKey last-payload cache. See §5 Path 3 of the
- *  design doc for the race that ruled out push-on-`setWrite`. */
+ *  relay to replay its per-paneKey last-payload cache. Pull, not push: a relay
+ *  that pushed on `setWrite` can emit before Orca has wired its `agent.hook`
+ *  handler, and those notifications are dropped silently. */
 export const AGENT_HOOK_REQUEST_REPLAY_METHOD = 'agent_hook.requestReplay' as const
 
 /** JSON-RPC request method Orca issues at session-ready to ship the
@@ -125,6 +249,8 @@ export type AgentHookInstallManagedHooksParams = {
   hostKeyFingerprint?: string
   /** Positively detected and enabled agents allowed to mutate remote config. */
   agents: readonly AgentHookTarget[]
+  /** Execution-host Claude version; absent means retain the legacy hook set. */
+  claudeVersion?: string
 }
 
 /** Feature-flag env var. Read once at process start by Orca and the relay.

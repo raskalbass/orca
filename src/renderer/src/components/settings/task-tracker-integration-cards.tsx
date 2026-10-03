@@ -1,3 +1,4 @@
+import { UnsealedCredentialNotice } from './UnsealedCredentialNotice'
 import { useState } from 'react'
 import { AlertCircle, CheckCircle2, LoaderCircle, Unlink } from 'lucide-react'
 import { LinearIcon } from '@/components/icons/LinearIcon'
@@ -91,7 +92,17 @@ export function LinearIntegrationCard(): React.JSX.Element {
       }
       checking={checking}
       statusTone={connected ? 'connected' : 'attention'}
-      statusLabel={connected ? 'Connected' : 'Not connected'}
+      statusLabel={
+        connected
+          ? translate(
+              'auto.components.settings.task.tracker.integration.cards.statusConnected',
+              'Connected'
+            )
+          : translate(
+              'auto.components.settings.task.tracker.integration.cards.statusNotConnected',
+              'Not connected'
+            )
+      }
       actions={
         !checking ? (
           <Button
@@ -114,6 +125,13 @@ export function LinearIntegrationCard(): React.JSX.Element {
     >
       <IntegrationCardDetails>
         <ProviderAccountScopeRow scope={accountScope} />
+        <UnsealedCredentialNotice
+          protection={linearStatus.credentialProtection ?? null}
+          credentialName={translate(
+            'auto.components.settings.task.tracker.integration.cards.linearTokenName',
+            'Your Linear API token'
+          )}
+        />
         {connected ? (
           <div className="space-y-2">
             {workspaces.map((workspace) => {

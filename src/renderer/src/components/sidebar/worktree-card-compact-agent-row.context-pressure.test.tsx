@@ -2,7 +2,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import type { ReactNode } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 import type { DashboardAgentRow as DashboardAgentRowData } from '@/components/dashboard/useDashboardData'
-import type { GlobalSettings } from '../../../../shared/types'
+import type { GlobalSettings } from '../../../../shared/global-settings-types'
 
 let settings: Partial<GlobalSettings> | null = null
 

@@ -11,7 +11,8 @@ const {
   relaunchAppMock,
   showOpenDialogMock,
   grantFloatingWorkspaceDirectoryMock,
-  registerRendererShutdownCheckpointHandlerMock
+  registerRendererShutdownCheckpointHandlerMock,
+  registerMacKeyboardLayoutChangeNotificationsMock
 } = vi.hoisted(() => ({
   handlers: new Map<string, (_event: unknown, args?: unknown) => unknown>(),
   appExitMock: vi.fn(),
@@ -22,7 +23,8 @@ const {
   relaunchAppMock: vi.fn(),
   showOpenDialogMock: vi.fn(),
   grantFloatingWorkspaceDirectoryMock: vi.fn(),
-  registerRendererShutdownCheckpointHandlerMock: vi.fn()
+  registerRendererShutdownCheckpointHandlerMock: vi.fn(),
+  registerMacKeyboardLayoutChangeNotificationsMock: vi.fn()
 }))
 
 vi.mock('node:child_process', () => ({
@@ -109,6 +111,31 @@ vi.mock('./renderer-shutdown-checkpoint', () => ({
   registerRendererShutdownCheckpointHandler: registerRendererShutdownCheckpointHandlerMock
 }))
 
+vi.mock('./macos-keyboard-layout-change-notifications', () => ({
+  registerMacKeyboardLayoutChangeNotifications: registerMacKeyboardLayoutChangeNotificationsMock
+}))
+
+const windowsProbes = vi.hoisted(() => ({
+  isWslAvailable: vi.fn(() => true),
+  isWslAvailableAsync: vi.fn(async () => true),
+  listWslDistros: vi.fn(() => ['Ubuntu']),
+  listWslDistrosAsync: vi.fn(async () => ['Ubuntu']),
+  isPwshAvailable: vi.fn(() => true),
+  isPwshAvailableAsync: vi.fn(async () => true)
+}))
+
+vi.mock('../wsl', () => ({
+  isWslAvailable: windowsProbes.isWslAvailable,
+  isWslAvailableAsync: windowsProbes.isWslAvailableAsync,
+  listWslDistros: windowsProbes.listWslDistros,
+  listWslDistrosAsync: windowsProbes.listWslDistrosAsync
+}))
+
+vi.mock('../pwsh', () => ({
+  isPwshAvailable: windowsProbes.isPwshAvailable,
+  isPwshAvailableAsync: windowsProbes.isPwshAvailableAsync
+}))
+
 import { registerAppHandlers } from './app'
 
 describe('registerAppHandlers', () => {
@@ -130,6 +157,10 @@ describe('registerAppHandlers', () => {
     showOpenDialogMock.mockReset()
     grantFloatingWorkspaceDirectoryMock.mockReset()
     registerRendererShutdownCheckpointHandlerMock.mockReset()
+    registerMacKeyboardLayoutChangeNotificationsMock.mockReset()
+    for (const probe of Object.values(windowsProbes)) {
+      probe.mockClear()
+    }
     processKillSpy = vi.spyOn(process, 'kill').mockReturnValue(true)
     Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true })
   })
@@ -146,6 +177,7 @@ describe('registerAppHandlers', () => {
     registerAppHandlers(store as never)
 
     expect(registerRendererShutdownCheckpointHandlerMock).toHaveBeenCalledWith(store)
+    expect(registerMacKeyboardLayoutChangeNotificationsMock).toHaveBeenCalledOnce()
   })
 
   it('marks relaunch as expected shutdown before exiting', async () => {
@@ -243,44 +275,53 @@ describe('registerAppHandlers', () => {
     expect(appExitMock).not.toHaveBeenCalled()
   })
 
-  it('returns the selected macOS input mode before the keyboard layout fallback', async () => {
-    Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true })
-    spawnMock.mockImplementation(() =>
-      createFakeSpawnChild({
-        stdout: JSON.stringify([
-          { 'Bundle ID': 'com.apple.PressAndHold', InputSourceKind: 'Non Keyboard Input Method' },
-          {
-            'Bundle ID': 'com.apple.inputmethod.SCIM',
-            'Input Mode': 'com.apple.inputmethod.SCIM.ITABC',
-            InputSourceKind: 'Input Mode'
-          }
-        ])
-      })
-    )
-    registerAppHandlers({} as never)
+  it.each([true, false])(
+    'prioritizes the selected input mode regardless of record order (%s)',
+    async (modeLast) => {
+      Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true })
+      const inputMode = {
+        'Bundle ID': 'com.apple.inputmethod.SCIM',
+        'Input Mode': 'com.apple.inputmethod.SCIM.ITABC',
+        InputSourceKind: 'Input Mode'
+      }
+      const keyboardLayout = {
+        InputSourceKind: 'Keyboard Layout',
+        'KeyboardLayout Name': 'ABC',
+        'KeyboardLayout ID': 252
+      }
+      spawnMock.mockImplementation(() =>
+        createFakeSpawnChild({
+          stdout: JSON.stringify([
+            { 'Bundle ID': 'com.apple.PressAndHold', InputSourceKind: 'Non Keyboard Input Method' },
+            ...(modeLast ? [keyboardLayout, inputMode] : [inputMode, keyboardLayout])
+          ])
+        })
+      )
+      registerAppHandlers({} as never)
 
-    await expect(handlers.get('app:getKeyboardInputSourceId')?.(null)).resolves.toBe(
-      'com.apple.inputmethod.SCIM.ITABC'
-    )
-    expect(spawnMock).toHaveBeenCalledTimes(1)
-    // Why: macOS 15's `plutil -extract <key> json` aborts on the input-source
-    // array, so the probe reads live cfprefsd via `defaults export` and dodges
-    // the bug with an xml1 extract before converting the clean subtree to JSON.
-    // Pin the exact pipeline (absolute paths, stdin markers) so dropping any
-    // stage silently regressing CJK detection to the fallback fails the test.
-    expect(spawnMock).toHaveBeenCalledWith(
-      '/bin/sh',
-      [
-        '-c',
-        '/usr/bin/defaults export com.apple.HIToolbox - | ' +
-          '/usr/bin/plutil -extract AppleSelectedInputSources xml1 -o - - | ' +
-          '/usr/bin/plutil -convert json -o - -'
-      ],
-      expect.objectContaining({ detached: true, stdio: ['ignore', 'pipe', 'ignore'] })
-    )
-  })
+      await expect(handlers.get('app:getKeyboardInputSourceId')?.(null)).resolves.toBe(
+        'com.apple.inputmethod.SCIM.ITABC'
+      )
+      expect(spawnMock).toHaveBeenCalledTimes(1)
+      // Why: macOS 15's `plutil -extract <key> json` aborts on the input-source
+      // array, so the probe reads live cfprefsd via `defaults export` and dodges
+      // the bug with an xml1 extract before converting the clean subtree to JSON.
+      // Pin the exact pipeline (absolute paths, stdin markers) so dropping any
+      // stage silently regressing CJK detection to the fallback fails the test.
+      expect(spawnMock).toHaveBeenCalledWith(
+        '/bin/sh',
+        [
+          '-c',
+          '/usr/bin/defaults export com.apple.HIToolbox - | ' +
+            '/usr/bin/plutil -extract AppleSelectedInputSources xml1 -o - - | ' +
+            '/usr/bin/plutil -convert json -o - -'
+        ],
+        expect.objectContaining({ detached: true, stdio: ['ignore', 'pipe', 'ignore'] })
+      )
+    }
+  )
 
-  it('falls back to the keyboard layout when no keyboard input mode is selected', async () => {
+  it('reads the layout ID only after a selected keyboard layout without a bundle ID is proved', async () => {
     Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true })
     spawnMock
       .mockImplementationOnce(() =>
@@ -289,6 +330,11 @@ describe('registerAppHandlers', () => {
             {
               'Bundle ID': 'com.apple.PressAndHold',
               InputSourceKind: 'Non Keyboard Input Method'
+            },
+            {
+              InputSourceKind: 'Keyboard Layout',
+              'KeyboardLayout Name': 'ABC',
+              'KeyboardLayout ID': 252
             }
           ])
         })
@@ -307,42 +353,34 @@ describe('registerAppHandlers', () => {
     )
   })
 
-  it('falls back to the keyboard layout when the selected input source probe exits non-zero', async () => {
+  it.each([
+    { name: 'nonzero exit', result: { code: 1 } },
+    { name: 'spawn failure', result: { error: new Error('spawn ENOENT') } },
+    { name: 'invalid JSON', result: { stdout: '{' } },
+    { name: 'non-array JSON', result: { stdout: '{}' } },
+    { name: 'empty records', result: { stdout: '[]' } },
+    { name: 'unknown record', result: { stdout: '[{"InputSourceKind":"Unknown"}]' } },
+    {
+      name: 'unidentified input mode',
+      result: { stdout: '[{"InputSourceKind":"Keyboard Layout"},{"InputSourceKind":"Input Mode"}]' }
+    },
+    {
+      name: 'non-keyboard record',
+      result: {
+        stdout:
+          '[{"InputSourceKind":"Non Keyboard Input Method","Bundle ID":"com.apple.PressAndHold"}]'
+      }
+    }
+  ])('does not infer the backing layout after $name', async ({ result }) => {
     Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true })
-    // Why: reproduces macOS 15's `plutil` abort — the pipeline exits non-zero, so
-    // the probe rejects on the `close` branch and the handler falls back.
-    spawnMock
-      .mockImplementationOnce(() => createFakeSpawnChild({ code: 1 }))
-      .mockImplementationOnce(() => createFakeSpawnChild({ stdout: 'com.apple.keylayout.ABC\n' }))
+    spawnMock.mockImplementation(() => createFakeSpawnChild(result))
     registerAppHandlers({} as never)
 
-    await expect(handlers.get('app:getKeyboardInputSourceId')?.(null)).resolves.toBe(
-      'com.apple.keylayout.ABC'
-    )
-    expect(spawnMock).toHaveBeenCalledTimes(2)
-    expect(spawnMock).toHaveBeenLastCalledWith(
-      '/usr/bin/defaults',
-      ['read', 'com.apple.HIToolbox', 'AppleCurrentKeyboardLayoutInputSourceID'],
-      expect.objectContaining({ detached: true })
-    )
+    await expect(handlers.get('app:getKeyboardInputSourceId')?.(null)).resolves.toBeNull()
+    expect(spawnMock).toHaveBeenCalledTimes(1)
   })
 
-  it('falls back to the keyboard layout when the selected input source probe fails to spawn', async () => {
-    Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true })
-    // Why: a spawn-level failure (ENOENT/EACCES) emits 'error'; the handler must
-    // still fall back rather than reject out of the IPC call.
-    spawnMock
-      .mockImplementationOnce(() => createFakeSpawnChild({ error: new Error('spawn ENOENT') }))
-      .mockImplementationOnce(() => createFakeSpawnChild({ stdout: 'com.apple.keylayout.ABC\n' }))
-    registerAppHandlers({} as never)
-
-    await expect(handlers.get('app:getKeyboardInputSourceId')?.(null)).resolves.toBe(
-      'com.apple.keylayout.ABC'
-    )
-    expect(spawnMock).toHaveBeenCalledTimes(2)
-  })
-
-  it('falls back when macOS keyboard input source probes never report completion', async () => {
+  it('returns unknown and cleans up when the selected-source probe times out', async () => {
     Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true })
     spawnMock.mockImplementation(() => createFakeSpawnChild({ pid: 4242, hang: true }))
     registerAppHandlers({} as never)
@@ -359,9 +397,8 @@ describe('registerAppHandlers', () => {
 
     expect(settled).toBe(true)
     await expect(resultPromise).resolves.toBeNull()
-    // Why: both wedged probes get a process-group SIGKILL (negative pid) so the
-    // shell and any orphaned `defaults`/`plutil` stages are reaped on timeout.
-    expect(processKillSpy).toHaveBeenCalledTimes(2)
+    expect(spawnMock).toHaveBeenCalledTimes(1)
+    expect(processKillSpy).toHaveBeenCalledTimes(1)
     expect(processKillSpy).toHaveBeenCalledWith(-4242, 'SIGKILL')
   })
 
@@ -380,5 +417,22 @@ describe('registerAppHandlers', () => {
       properties: ['openDirectory']
     })
     expect(grantFloatingWorkspaceDirectoryMock).toHaveBeenCalledWith(store, '/Users/kaylee/notes')
+  })
+
+  // Why: the renderer reads these on every Windows capability refresh; the sync probes
+  // execFileSync wsl.exe/pwsh.exe and would stall the main event loop for up to 5s each.
+  it('answers the Windows shell capability channels without a blocking spawn', async () => {
+    registerAppHandlers({} as never)
+
+    await expect(handlers.get('wsl:isAvailable')?.(null)).resolves.toBe(true)
+    await expect(handlers.get('wsl:listDistros')?.(null)).resolves.toEqual(['Ubuntu'])
+    await expect(handlers.get('pwsh:isAvailable')?.(null)).resolves.toBe(true)
+
+    expect(windowsProbes.isWslAvailableAsync).toHaveBeenCalledTimes(1)
+    expect(windowsProbes.listWslDistrosAsync).toHaveBeenCalledTimes(1)
+    expect(windowsProbes.isPwshAvailableAsync).toHaveBeenCalledTimes(1)
+    expect(windowsProbes.isWslAvailable).not.toHaveBeenCalled()
+    expect(windowsProbes.listWslDistros).not.toHaveBeenCalled()
+    expect(windowsProbes.isPwshAvailable).not.toHaveBeenCalled()
   })
 })

@@ -1,6 +1,7 @@
 import type { RpcClient } from '../transport/rpc-client'
-import type { RpcSuccess } from '../transport/types'
+import type { RpcFailure } from '../transport/types'
 import type { Worktree } from './workspace-list-sections'
+import { worktreeCatalogRead } from './worktree-catalog-operations'
 
 // Why: worktree.ps silently truncates at 200; use a high cap so large hosts don't drop workspaces.
 export const WORKTREE_PS_FULL_LIMIT = 10_000
@@ -10,11 +11,18 @@ export type WorktreeCatalogAdmission<T> =
   | { kind: 'unchanged'; snapshotId: string }
   | { kind: 'invalid' }
 
-type PendingWorktreeCatalog = {
+export type PendingWorktreeCatalog = {
   admission: WorktreeCatalogAdmission<Worktree>
   client: RpcClient
   hostId: string
 }
+
+// Why (STA-3123): a failed worktree.ps must stay distinguishable from an empty
+// catalog — collapsing both to "no rows" made unreachable remote-server catalogs
+// render as a healthy host with 0 worktrees.
+export type WorktreeCatalogFetchResult =
+  | { kind: 'response'; pending: PendingWorktreeCatalog }
+  | { kind: 'request_failed'; code: string }
 
 function validSnapshotId(value: unknown): string | null {
   return typeof value === 'string' && value.length > 0 && value.length <= 128 ? value : null
@@ -56,7 +64,7 @@ export class WorktreeCatalogSnapshotClient {
   private snapshotId: string | null = null
   private confirmedWorktrees: Worktree[] | null = null
 
-  async fetch(client: RpcClient, hostId: string): Promise<PendingWorktreeCatalog | null> {
+  async fetch(client: RpcClient, hostId: string): Promise<WorktreeCatalogFetchResult> {
     if (this.client !== client || this.hostId !== hostId) {
       this.client = client
       this.hostId = hostId
@@ -64,20 +72,27 @@ export class WorktreeCatalogSnapshotClient {
       this.confirmedWorktrees = null
     }
     const requestedSnapshotId = this.snapshotId
-    const response = await client.sendRequest('worktree.ps', {
+    const reply = await worktreeCatalogRead.request(client, {
       limit: WORKTREE_PS_FULL_LIMIT,
       afterSnapshotId: requestedSnapshotId
     })
-    if (!response.ok) {
-      return null
+    const catalog = worktreeCatalogRead.interpret(reply)
+    if (!catalog.accepted) {
+      // The refusal code the caller reports lives on the envelope; no acceptance policy carries it.
+      // oxlint-disable-next-line typescript/consistent-type-assertions -- SAFETY: this policy skips only a refusal, so an unaccepted reply is a failure envelope.
+      const code = (reply as RpcFailure).error?.code
+      return {
+        kind: 'request_failed',
+        code: typeof code === 'string' && code.length > 0 ? code : 'request_failed'
+      }
     }
     return {
-      admission: admitWorktreeCatalogResponse<Worktree>(
-        (response as RpcSuccess).result,
-        requestedSnapshotId
-      ),
-      client,
-      hostId
+      kind: 'response',
+      pending: {
+        admission: admitWorktreeCatalogResponse<Worktree>(catalog.value, requestedSnapshotId),
+        client,
+        hostId
+      }
     }
   }
 

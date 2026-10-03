@@ -1,7 +1,8 @@
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 import type { AgentStatusEntry } from '../../../../shared/agent-status-types'
-import type { GlobalSettings, TerminalTab } from '../../../../shared/types'
+import type { GlobalSettings } from '../../../../shared/global-settings-types'
+import type { TerminalTab } from '../../../../shared/terminal-tab-types'
 import { TooltipProvider } from '../ui/tooltip'
 import type { DashboardAgentRow as DashboardAgentRowData } from './useDashboardData'
 

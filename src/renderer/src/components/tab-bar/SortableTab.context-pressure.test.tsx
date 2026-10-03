@@ -5,7 +5,8 @@ import { cleanup, render } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ReactNode } from 'react'
 import type { AgentStatusEntry } from '../../../../shared/agent-status-types'
-import type { GlobalSettings, TerminalTab } from '../../../../shared/types'
+import type { GlobalSettings } from '../../../../shared/global-settings-types'
+import type { TerminalTab } from '../../../../shared/terminal-tab-types'
 
 let settings: Partial<GlobalSettings> | null = null
 let agentStatusByPaneKey: Record<string, AgentStatusEntry> = {}

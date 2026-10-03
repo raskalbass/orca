@@ -61,7 +61,7 @@ function clampTokens(value: number): number {
 export function normalizeContextPressureSoftLimitKey(value: string): string {
   const trimmed = value.trim().toLowerCase()
   const separator = trimmed.indexOf(':')
-  if (separator < 0) {
+  if (separator === -1) {
     return trimmed
   }
   const scope = trimmed.slice(0, separator)
@@ -82,6 +82,22 @@ export function normalizeContextPressurePercent(value: unknown, fallback: number
     return fallback
   }
   return Math.min(100, Math.max(1, Math.round(value)))
+}
+
+/** Normalizes the warn/critical pair so critical never sits below warn. */
+export function normalizeContextPressureThresholds(
+  warnValue: unknown,
+  criticalValue: unknown
+): { warnPercent: number; criticalPercent: number } {
+  const warnPercent = normalizeContextPressurePercent(
+    warnValue,
+    DEFAULT_CONTEXT_PRESSURE_WARN_PERCENT
+  )
+  const criticalPercent = Math.max(
+    warnPercent,
+    normalizeContextPressurePercent(criticalValue, DEFAULT_CONTEXT_PRESSURE_CRITICAL_PERCENT)
+  )
+  return { warnPercent, criticalPercent }
 }
 
 /** Sanitize a user-configured soft-limits record: positive finite integer caps,

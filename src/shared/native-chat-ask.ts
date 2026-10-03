@@ -4,21 +4,26 @@ import type {
   AskQuestion,
   InteractiveQuestionParser
 } from './native-chat-ask-types'
-import type { NativeChatMessage } from './native-chat-types'
+import { isInterruptedStatusMessage, type NativeChatMessage } from './native-chat-types'
 
 export type { AskOption, AskPrompt, AskQuestion, InteractiveQuestionParser }
 
 const QUESTION_TOOL_PARSERS = new Map<string, InteractiveQuestionParser>()
 
+/** Stable cross-platform identity for one canonical question prompt. */
+export function nativeChatAskDismissKey(prompt: AskPrompt | null): string | null {
+  return prompt ? `question:${JSON.stringify(prompt.questions)}` : null
+}
+
 export function registerQuestionTool(toolName: string, parser: InteractiveQuestionParser): void {
   QUESTION_TOOL_PARSERS.set(toolName, parser)
 }
 
-function parseQuestionsShape(input: unknown): AskPrompt | null {
-  if (!input || typeof input !== 'object') {
+function parseCanonicalQuestionsInput(input: unknown): AskPrompt | null {
+  if (!input || typeof input !== 'object' || !('questions' in input)) {
     return null
   }
-  const rawQuestions = (input as { questions?: unknown }).questions
+  const rawQuestions = input.questions
   if (!Array.isArray(rawQuestions) || rawQuestions.length === 0) {
     return null
   }
@@ -27,14 +32,16 @@ function parseQuestionsShape(input: unknown): AskPrompt | null {
     if (!raw || typeof raw !== 'object') {
       continue
     }
-    const question = raw as Record<string, unknown>
-    const text = typeof question.question === 'string' ? question.question : ''
-    const options = parseOptions(question.options)
+    const text = 'question' in raw && typeof raw.question === 'string' ? raw.question : ''
+    const options = parseOptions('options' in raw ? raw.options : undefined)
     if (text || options.length > 0) {
       questions.push({
         question: text,
-        header: typeof question.header === 'string' ? question.header : undefined,
-        multiSelect: question.multiSelect === true,
+        header: 'header' in raw && typeof raw.header === 'string' ? raw.header : undefined,
+        multiSelect:
+          'multiSelect' in raw
+            ? raw.multiSelect === true
+            : 'multiple' in raw && raw.multiple === true,
         options
       })
     }
@@ -54,12 +61,15 @@ function parseOptions(raw: unknown): AskOption[] {
       if (
         option &&
         typeof option === 'object' &&
-        typeof (option as { label?: unknown }).label === 'string'
+        'label' in option &&
+        typeof option.label === 'string'
       ) {
-        const value = option as { label: string; description?: unknown }
         return {
-          label: value.label,
-          description: typeof value.description === 'string' ? value.description : undefined
+          label: option.label,
+          description:
+            'description' in option && typeof option.description === 'string'
+              ? option.description
+              : undefined
         }
       }
       return null
@@ -68,12 +78,12 @@ function parseOptions(raw: unknown): AskOption[] {
 }
 
 for (const name of ['AskUserQuestion', 'ask_user_question', 'askUserQuestion']) {
-  QUESTION_TOOL_PARSERS.set(name, parseQuestionsShape)
+  QUESTION_TOOL_PARSERS.set(name, parseCanonicalQuestionsInput)
 }
 
 function parseToolInput(toolName: string | undefined, input: unknown): AskPrompt | null {
   const parser = toolName ? QUESTION_TOOL_PARSERS.get(toolName) : undefined
-  return (parser ? parser(input) : null) ?? parseQuestionsShape(input)
+  return (parser ? parser(input) : null) ?? parseCanonicalQuestionsInput(input)
 }
 
 export function parseAskFromStatus(
@@ -90,30 +100,69 @@ export function parseAskFromStatus(
   }
 }
 
+/** Parse a question tool call's own input, through the same registered-parser
+ *  dispatch live status uses. Codex delivers arguments as a JSON string, so a
+ *  string input is decoded rather than treated as prose. */
+export function parseAskFromToolInput(
+  toolName: string | undefined,
+  input: unknown
+): AskPrompt | null {
+  return typeof input === 'string'
+    ? parseAskFromStatus(input, toolName)
+    : parseToolInput(toolName, input)
+}
+
 /** Resolve the newest question tool that has not received its FIFO tool result.
  *  Transcript replay parses each tool-call through the same registered-parser +
  *  canonical-shape fallback as live status, so a question tool that rendered
  *  live cannot vanish from pending state after a reconnect/replay. */
 export function extractPendingAsk(messages: readonly NativeChatMessage[]): AskPrompt | null {
   let pending: AskPrompt | null = null
-  const outstanding: (AskPrompt | null)[] = []
+  // The FIFO is two counters, not a queue: a result only needs to know how far the
+  // call that produced `pending` sits from the head, so nothing is retained per call.
+  let outstanding = 0
+  let pendingDepth = -1
   for (const message of messages) {
+    // A new user turn (or an interrupt row) ends the turn that owns whatever
+    // calls are still in flight: their results never arrive, and `tool_use_id`
+    // is dropped at decode time so those orphans can never be matched by id.
+    // Without this reset one orphan shifts the result FIFO for the rest of the
+    // transcript and strands an answered ask as a permanent card over the
+    // composer (#11761). Claude's tool-result turns decode as role 'tool'.
+    if (message.role === 'user' || isInterruptedStatusMessage(message)) {
+      outstanding = 0
+      pendingDepth = -1
+      pending = null
+    }
     for (const block of message.blocks) {
       if (block.type === 'tool-call') {
         const parsed = parseToolInput(block.name, block.input)
         if (parsed) {
           pending = parsed
+          pendingDepth = outstanding
         }
-        outstanding.push(parsed)
-      } else if (block.type === 'tool-result' && outstanding.length > 0) {
-        const resolved = outstanding.shift()
-        if (resolved && resolved === pending) {
+        outstanding += 1
+      } else if (block.type === 'tool-result' && outstanding > 0) {
+        outstanding -= 1
+        if (pendingDepth === 0) {
           pending = null
+          pendingDepth = -1
+        } else if (pendingDepth > 0) {
+          pendingDepth -= 1
         }
       }
     }
   }
   return pending
+}
+
+/** Prefers live status and consults transcript history only after its read settles. */
+export function resolveNativeChatAsk(args: {
+  liveAsk: AskPrompt | null
+  messages: readonly NativeChatMessage[]
+  transcriptSettled: boolean
+}): AskPrompt | null {
+  return args.liveAsk ?? (args.transcriptSettled ? extractPendingAsk(args.messages) : null)
 }
 
 /** One question's chosen answer, normalized for delivery: the selected option

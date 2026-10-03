@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
-import { briefToolArg, summarizeToolInput, toolFilePath } from './mobile-native-chat-tool-summary'
+import {
+  describeToolInput,
+  summarizeToolInput,
+  toolFilePath
+} from '../../../src/shared/native-chat-tool-summary'
 
 describe('summarizeToolInput', () => {
   it('passes short strings through, collapsing whitespace', () => {
@@ -53,12 +57,9 @@ describe('toolFilePath', () => {
   })
 })
 
-describe('briefToolArg', () => {
-  it('takes the basename of a forward-slash path', () => {
-    expect(briefToolArg({ path: 'src/session/app.ts' })).toBe('app.ts')
-  })
-
-  it('takes the basename of a Windows backslash path from a raw transcript', () => {
-    expect(briefToolArg({ file_path: 'C:\\Users\\me\\project\\app.tsx' })).toBe('app.tsx')
+describe('describeToolInput', () => {
+  it('labels rows with the path or primary argument', () => {
+    expect(describeToolInput({ file_path: 'src/a.ts', offset: 3 })).toBe('src/a.ts')
+    expect(describeToolInput('{"cmd":"git status"}')).toBe('git status')
   })
 })
