@@ -2,8 +2,10 @@ import {
   AGENT_HOOK_NOTIFICATION_METHOD,
   AGENT_HOOK_SHED_FIELDS_KEY,
   createShedSubagentsField,
+  type AgentHookUnavailableEnvelope,
   type AgentHookRelayEnvelope
 } from '../shared/agent-hook-relay'
+import type { ParsedAgentStatusPayload } from '../shared/agent-status-types'
 import type { RelayDispatcher } from './dispatcher'
 
 // Why: shed the biggest, most reconstructible fields first — state/paneKey must survive or the pane
@@ -36,6 +38,7 @@ type RedeliveryState = {
 }
 
 const redeliveryByDispatcher = new WeakMap<RelayDispatcher, RedeliveryState>()
+type StatusPayloadEnvelope = AgentHookRelayEnvelope & { payload: ParsedAgentStatusPayload }
 // Why: some agents submit option labels verbatim, so only presentation-only fields may shrink.
 const COMPACTABLE_INTERACTIVE_PROMPT_FIELDS = new Set([
   'description',
@@ -78,9 +81,9 @@ function compactInteractivePromptValue(value: unknown, maxStringLength: number):
 
 function fitWaitingInteractivePrompt(
   dispatcher: RelayDispatcher,
-  envelope: AgentHookRelayEnvelope,
+  envelope: StatusPayloadEnvelope,
   shedFields: readonly string[]
-): AgentHookRelayEnvelope | null {
+): StatusPayloadEnvelope | null {
   const prompt = envelope.payload.interactivePrompt
   if (!prompt) {
     return null
@@ -97,7 +100,7 @@ function fitWaitingInteractivePrompt(
       : JSON.stringify(compactInteractivePromptValue(parsed, limit))
   let low = 1
   let high = prompt.length
-  let fitted: AgentHookRelayEnvelope | null = null
+  let fitted: StatusPayloadEnvelope | null = null
   while (low <= high) {
     const mid = Math.floor((low + high) / 2)
     const candidate = {
@@ -156,17 +159,32 @@ function logUnsendableEnvelope(
  *  background; one that no shedding can fit is dropped. */
 export function publishAgentHookEnvelope(
   dispatcher: RelayDispatcher,
-  envelope: AgentHookRelayEnvelope
+  envelope: AgentHookRelayEnvelope | AgentHookUnavailableEnvelope
 ): void {
   const clientIds = dispatcher.activeClientIds()
   if (clientIds.length === 0) {
+    return
+  }
+  if (envelope.payload === null || envelope.payload === undefined) {
+    const params = { ...envelope }
+    if (!fitsProducerFrame(dispatcher, params)) {
+      clearPendingEnvelope(dispatcher, envelope.paneKey)
+      logUnsendableEnvelope(dispatcher, params, clientIds)
+      return
+    }
+    const rejected = publishToClients(dispatcher, params, clientIds)
+    if (rejected.length === 0) {
+      clearPendingEnvelope(dispatcher, envelope.paneKey)
+    } else {
+      setPendingEnvelope(dispatcher, envelope.paneKey, params, rejected)
+    }
     return
   }
   // Why: a fan-out must choose one payload before it writes anything, or the first client keeps a
   // frame a smaller later client forces us to shed. A single sink writes nothing when it rejects,
   // so there the attempt itself is the measurement — one encode instead of a probe plus a publish.
   const measureBeforePublish = clientIds.length > 1
-  let candidate = envelope
+  let candidate: StatusPayloadEnvelope = { ...envelope, payload: envelope.payload }
   const shedFields: string[] = []
   let step = 0
   for (;;) {

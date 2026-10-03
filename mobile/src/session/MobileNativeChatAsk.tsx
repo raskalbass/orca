@@ -1,8 +1,9 @@
 import { useMemo, useRef, useState } from 'react'
 import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native'
 import { Check } from 'lucide-react-native'
+import type { AskAnswerSelection, AskPrompt } from '../../../src/shared/native-chat-ask'
 import { colors, radii, spacing, typography } from '../theme/mobile-theme'
-import type { AskAnswerSelection, AskPrompt } from './mobile-native-chat-ask'
+import { TEXT_INPUT_FONT_SIZE } from '../platform/text-input-font-size'
 
 type Props = {
   prompt: AskPrompt
@@ -187,7 +188,7 @@ export function MobileNativeChatAsk({ prompt, onAnswer, onCancel }: Props): Reac
           disabled={!canAdvance}
         >
           <Text style={[styles.nextText, !canAdvance && styles.nextTextDisabled]}>
-            {isLast ? 'Send answer' : 'Next'}
+            {isLast ? 'Submit' : 'Next'}
           </Text>
         </Pressable>
       </View>
@@ -331,7 +332,7 @@ const styles = StyleSheet.create({
     borderColor: colors.borderSubtle,
     borderRadius: radii.card,
     color: colors.textPrimary,
-    fontSize: typography.bodySize,
+    fontSize: TEXT_INPUT_FONT_SIZE,
     padding: spacing.sm,
     minHeight: 44,
     marginBottom: spacing.xs

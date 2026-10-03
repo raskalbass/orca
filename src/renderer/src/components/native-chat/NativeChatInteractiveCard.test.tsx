@@ -5,7 +5,7 @@ import '@testing-library/jest-dom/vitest'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { NativeChatMessage } from '../../../../shared/native-chat-types'
-import { applyCommandMarkerBoundaries } from './native-chat-pending'
+import { applyCommandMarkerBoundaries } from './native-chat-command-marker'
 import type { NativeChatInteractiveSend } from './use-native-chat-interactive-send'
 
 const INITIAL_PROMPT = JSON.stringify({
@@ -33,34 +33,66 @@ vi.mock('../../store', () => ({
 }))
 
 import { NativeChatInteractiveCard } from './NativeChatInteractiveCard'
+import { useNativeChatInteractivePromptCard } from './use-native-chat-interactive-prompt-card'
 
 const mocks = {
   sendAnswer: vi.fn<NativeChatInteractiveSend['sendAnswer']>(),
   sendRaw: vi.fn<NativeChatInteractiveSend['sendRaw']>(),
   cancelPending: vi.fn<NativeChatInteractiveSend['cancelPending']>(),
-  cancel: vi.fn<NativeChatInteractiveSend['cancel']>()
+  cancel: vi.fn<NativeChatInteractiveSend['cancel']>(),
+  cancelAsk: vi.fn<NativeChatInteractiveSend['cancelAsk']>()
 }
 
 function renderCard(canSend = true): ReturnType<typeof render> {
   return render(cardElement(canSend))
 }
 
+const NO_MESSAGES: readonly NativeChatMessage[] = []
+
 function cardElement(
   canSend = true,
   messages?: readonly NativeChatMessage[],
-  onShowingQuestionChange?: (showing: boolean) => void
+  onShowingQuestionChange?: (showing: boolean) => void,
+  transcriptSettled = true
 ): React.JSX.Element {
   return (
-    <NativeChatInteractiveCard
-      paneKey="tab-1:leaf-1"
+    <CardHarness
       canSend={canSend}
       messages={messages}
+      onShowingQuestionChange={onShowingQuestionChange}
+      transcriptSettled={transcriptSettled}
+    />
+  )
+}
+
+// The view derives the card and hands it over; this stands in for that view.
+function CardHarness({
+  canSend,
+  messages,
+  onShowingQuestionChange,
+  transcriptSettled
+}: {
+  canSend: boolean
+  messages?: readonly NativeChatMessage[]
+  onShowingQuestionChange?: (showing: boolean) => void
+  transcriptSettled: boolean
+}): React.JSX.Element | null {
+  const card = useNativeChatInteractivePromptCard({
+    paneKey: 'tab-1:leaf-1',
+    messages: messages ?? NO_MESSAGES,
+    transcriptSettled: transcriptSettled && messages !== undefined
+  })
+  return (
+    <NativeChatInteractiveCard
+      card={card}
+      canSend={canSend}
       onShowingQuestionChange={onShowingQuestionChange}
       send={{
         sendAnswer: mocks.sendAnswer,
         sendRaw: mocks.sendRaw,
         cancelPending: mocks.cancelPending,
-        cancel: mocks.cancel
+        cancel: mocks.cancel,
+        cancelAsk: mocks.cancelAsk
       }}
     />
   )
@@ -101,10 +133,20 @@ function askResultMessage(): NativeChatMessage {
 
 function chooseSpacesAndSubmit(): void {
   fireEvent.click(screen.getByRole('button', { name: /Spaces/ }))
-  fireEvent.click(screen.getByRole('button', { name: 'Send answer' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Submit' }))
 }
 
 describe('NativeChatInteractiveCard answer lifecycle', () => {
+  it('routes question Cancel to rejection and releases the composer slot without Stop', () => {
+    const onShowingQuestionChange = vi.fn()
+    render(cardElement(true, undefined, onShowingQuestionChange))
+    expect(screen.getByTestId('native-chat-question-card-title')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(mocks.cancelAsk).toHaveBeenCalledOnce()
+    expect(mocks.cancel).not.toHaveBeenCalled()
+    expect(screen.queryByTestId('native-chat-question-card-title')).not.toBeInTheDocument()
+    expect(onShowingQuestionChange).toHaveBeenLastCalledWith(false)
+  })
   beforeEach(() => {
     vi.clearAllMocks()
     storeState.agentStatusByPaneKey['tab-1:leaf-1'].interactivePrompt = INITIAL_PROMPT
@@ -122,7 +164,7 @@ describe('NativeChatInteractiveCard answer lifecycle', () => {
     chooseSpacesAndSubmit()
     expect(screen.getByText('Tabs or spaces?')).toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Send answer' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Submit' }))
     expect(mocks.sendAnswer).toHaveBeenCalledTimes(2)
   })
 
@@ -205,7 +247,7 @@ describe('NativeChatInteractiveCard answer lifecycle', () => {
     chooseSpacesAndSubmit()
     act(() => settleDelivery?.(false))
 
-    expect(screen.getByRole('button', { name: 'Send answer' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Submit' })).toBeEnabled()
     expect(screen.getByText('Tabs or spaces?')).toBeInTheDocument()
   })
 })
@@ -231,6 +273,12 @@ describe('NativeChatInteractiveCard transcript fallback', () => {
 
     expect(screen.getByText('Tabs or spaces?')).toBeInTheDocument()
     expect(onShowingQuestionChange).toHaveBeenCalledWith(true)
+  })
+
+  it('withholds a retained transcript ask while its replacement read is unsettled', () => {
+    render(cardElement(true, [askCallMessage('Stale transcript question?')], undefined, false))
+
+    expect(screen.queryByText('Stale transcript question?')).not.toBeInTheDocument()
   })
 
   it('prefers live status over the transcript when both carry a prompt', () => {

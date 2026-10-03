@@ -1,4 +1,4 @@
-import type { WorktreeCardProperty } from '../../../../shared/types'
+import type { WorktreeCardProperty } from '../../../../shared/ui-chrome-types'
 import { translate } from '@/i18n/i18n'
 
 export const PROPERTY_OPTIONS: { id: WorktreeCardProperty; label: string }[] = [
@@ -67,5 +67,23 @@ export const PROPERTY_OPTIONS: { id: WorktreeCardProperty; label: string }[] = [
         'Agent activity'
       )
     }
+  },
+  {
+    id: 'host',
+    get label() {
+      return translate('auto.components.sidebar.SidebarWorkspaceOptionsMenu.host', 'Host')
+    }
   }
 ]
+
+/** Offered only while experimentalContextPressure is on — toggling a property
+ *  that can never render would read as a broken checkbox. */
+export const CONTEXT_PRESSURE_PROPERTY_OPTION: { id: WorktreeCardProperty; label: string } = {
+  id: 'context-pressure',
+  get label() {
+    return translate(
+      'auto.components.sidebar.SidebarWorkspaceOptionsMenu.contextPressure',
+      'Context pressure'
+    )
+  }
+}

@@ -2,8 +2,14 @@ import { memo } from 'react'
 import { StyleSheet, Text, View } from 'react-native'
 import type { RuntimeWorktreeAgentRow } from '../../../src/shared/runtime-types'
 import { colors, spacing } from '../theme/mobile-theme'
-import { agentDisplayLabel, agentDotState, formatTimeAgo } from '../worktree/agent-row-display'
+import {
+  agentDisplayLabel,
+  agentDotState,
+  agentRowTimeAt,
+  formatTimeAgo
+} from '../worktree/agent-row-display'
 import { AgentStateDot } from './AgentStateDot'
+import { ContextPressureDot } from './ContextPressureDot'
 import { MobileAgentIcon } from './MobileAgentIcon'
 
 const INDENT_PER_DEPTH = 14
@@ -22,7 +28,7 @@ type Props = {
 function WorktreeAgentRowComponent({ agent, depth, now, unvisited }: Props) {
   const dotState = agentDotState(agent, now)
   const label = agentDisplayLabel(agent, now)
-  const ts = formatTimeAgo(agent.stateStartedAt, now)
+  const ts = formatTimeAgo(agentRowTimeAt(agent), now)
 
   return (
     <View style={[styles.row, { paddingLeft: depth * INDENT_PER_DEPTH }]}>
@@ -33,6 +39,8 @@ function WorktreeAgentRowComponent({ agent, depth, now, unvisited }: Props) {
       <Text style={[styles.label, unvisited && styles.labelUnvisited]} numberOfLines={1}>
         {label}
       </Text>
+      {/* Individual rows show all known pressure levels. */}
+      {agent.contextPressure ? <ContextPressureDot pressure={agent.contextPressure} /> : null}
       <Text style={styles.time}>{ts}</Text>
     </View>
   )

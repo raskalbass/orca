@@ -1,13 +1,14 @@
 // @vitest-environment happy-dom
 
+import { resetLocalStructuredChatsForTests } from '@/runtime/local-structured-chats'
 import { act } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { GlobalSettings } from '../../../../shared/types'
+import type { GlobalSettings } from '../../../../shared/global-settings-types'
 import { getDefaultSettings } from '../../../../shared/constants'
 import { ExperimentalPane } from './ExperimentalPane'
-import { getExperimentalPaneSearchEntries } from './experimental-search'
+import { getExperimentalPaneSearchEntries, getExperimentalSearchEntry } from './experimental-search'
 
 vi.mock('../../store', () => ({
   useAppStore: (selector: (state: { settingsSearchQuery: string }) => unknown) =>
@@ -72,6 +73,12 @@ vi.mock('../ui/select', async () => {
 afterEach(() => {
   document.body.innerHTML = ''
 })
+
+function setInputValue(input: HTMLInputElement, value: string): void {
+  const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+  setValue?.call(input, value)
+  input.dispatchEvent(new Event('input', { bubbles: true }))
+}
 
 async function renderExperimentalPane(args: {
   updateSettings: (settings: Partial<GlobalSettings>) => void
@@ -138,7 +145,7 @@ describe('ExperimentalPane', () => {
       <ExperimentalPane settings={settings} updateSettings={vi.fn()} />
     )
 
-    expect(settings.experimentalAgentDashboardPopout).toBe(false)
+    expect(settings.experimentalAgentDashboardPopout).toBeUndefined()
     expect(markup).toContain('Agent Dashboard')
     expect(markup).toContain('Monitor agents that need you, are working, or are done')
     expect(getExperimentalPaneSearchEntries().map((entry) => entry.title)).toContain(
@@ -164,29 +171,15 @@ describe('ExperimentalPane', () => {
     root.unmount()
   })
 
-  it('exposes idle-agent visibility for pop-out dashboards', async () => {
-    const updateSettings = vi.fn()
-    const settings = {
-      ...getDefaultSettings('/tmp'),
-      experimentalAgentDashboardPopout: true
-    }
-    const { root, container } = await renderExperimentalPane({
-      settings,
-      updateSettings
-    })
-    const idleSwitch = container.querySelector<HTMLButtonElement>(
-      '#experimental-agent-dashboard button[role="switch"][aria-label="Show idle agents"]'
+  it('keeps idle-agent visibility out of global settings', () => {
+    const markup = renderToStaticMarkup(
+      <ExperimentalPane
+        settings={{ ...getDefaultSettings('/tmp'), experimentalAgentDashboardPopout: true }}
+        updateSettings={vi.fn()}
+      />
     )
-    if (!idleSwitch) {
-      throw new Error('Idle-agent visibility switch was not rendered')
-    }
 
-    await act(async () => {
-      idleSwitch.dispatchEvent(new MouseEvent('click', { bubbles: true }))
-    })
-
-    expect(updateSettings).toHaveBeenCalledWith({ experimentalAgentDashboardShowIdle: true })
-    root.unmount()
+    expect(markup).not.toContain('Show idle agents')
   })
 
   it('renders Cloud VM as an off-by-default experimental subsection', () => {
@@ -234,6 +227,139 @@ describe('ExperimentalPane', () => {
 
     expect(markup).toContain('Cloud VM pane')
     expect(markup).toContain('aria-checked="true"')
+  })
+
+  it('shows the structured-native-chat child setting only when Chat UI is the default view', async () => {
+    const updateSettings = vi.fn()
+    const disabledSettings = getDefaultSettings('/tmp')
+    const disabledMarkup = renderToStaticMarkup(
+      <ExperimentalPane settings={disabledSettings} updateSettings={vi.fn()} />
+    )
+    expect(disabledMarkup).toContain('Chat UI')
+    expect(disabledMarkup).not.toContain('Use updated structured native chat')
+    expect(disabledMarkup).not.toContain('Default view')
+
+    const terminalDefault = {
+      ...getDefaultSettings('/tmp'),
+      experimentalNativeChat: true,
+      experimentalStructuredNativeChat: false,
+      openAgentTabsInChatByDefault: false
+    }
+    const terminalRender = await renderExperimentalPane({
+      updateSettings,
+      settings: terminalDefault
+    })
+
+    // The default-view control is a sibling of the Chat UI toggle, never replaced by the opt-in.
+    expect(terminalRender.container.textContent).toContain('Default view')
+    expect(
+      terminalRender.container.querySelector('[data-slot="native-chat-default-view-select"]')
+    ).not.toBeNull()
+    // Structured chat has no entry path under Terminal chat, so its opt-in is not offered.
+    expect(terminalRender.container.textContent).not.toContain('Use updated structured native chat')
+    terminalRender.root.unmount()
+
+    const { root, container } = await renderExperimentalPane({
+      updateSettings,
+      settings: { ...terminalDefault, openAgentTabsInChatByDefault: true }
+    })
+
+    expect(container.textContent).toContain('Use updated structured native chat')
+    // The one setting governs both providers, so its copy must not name only Codex.
+    expect(container.textContent).toContain('Open new Codex and Claude agents as structured chats.')
+    // The setting picks what new agents open as; existing chats are left alone.
+    expect(container.textContent).toContain('Chats that already exist stay as they are.')
+    // Paired Orca servers run structured chats too; only WSL and SSH stay on terminal chat.
+    expect(container.textContent).toContain(
+      'Runs on this machine and on paired Orca servers running a version that supports it; older servers keep terminal chat. WSL and SSH hosts continue to use terminal chat, and Windows falls back to it unless Orca can read process start times.'
+    )
+    expect(container.textContent).toContain('Default view')
+    root.unmount()
+  })
+
+  // Those settings govern the chats this machine holds, which keep running with the setting off.
+  it('shows the structured chat settings while this machine holds chats, whatever the setting', async () => {
+    Object.defineProperty(window, 'api', {
+      configurable: true,
+      value: {
+        app: {
+          holdsStructuredAgentSessions: async () => true,
+          onStructuredAgentSessionsHeldChanged: () => () => undefined
+        }
+      }
+    })
+    try {
+      const { root, container } = await renderExperimentalPane({
+        updateSettings: vi.fn(),
+        settings: { ...getDefaultSettings('/tmp'), experimentalNativeChat: true }
+      })
+      await act(async () => {
+        await Promise.resolve()
+      })
+
+      expect(container.textContent).toContain('Resume working chats automatically after a restart')
+      root.unmount()
+    } finally {
+      resetLocalStructuredChatsForTests()
+      Reflect.deleteProperty(window, 'api')
+    }
+  })
+
+  it('hides the structured chat settings on a machine that holds none with the setting off', async () => {
+    const { root, container } = await renderExperimentalPane({
+      updateSettings: vi.fn(),
+      settings: { ...getDefaultSettings('/tmp'), experimentalNativeChat: true }
+    })
+
+    expect(container.textContent).not.toContain(
+      'Resume working chats automatically after a restart'
+    )
+    root.unmount()
+  })
+
+  it('hides a stale structured opt-in under Terminal chat without clearing it', async () => {
+    const updateSettings = vi.fn()
+    const settings = {
+      ...getDefaultSettings('/tmp'),
+      experimentalNativeChat: true,
+      experimentalStructuredNativeChat: true,
+      openAgentTabsInChatByDefault: true
+    }
+    const { root, container } = await renderExperimentalPane({ updateSettings, settings })
+
+    expect(container.textContent).toContain('Use updated structured native chat')
+
+    const terminalChatOption = Array.from(
+      container.querySelectorAll<HTMLButtonElement>('[data-slot="select-item"]')
+    ).find((button) => button.getAttribute('data-value') === 'terminal-chat')
+    if (!terminalChatOption) {
+      throw new Error('Terminal chat default-view option was not rendered')
+    }
+
+    await act(async () => {
+      terminalChatOption.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    // Switching the default view must not clobber the persisted opt-in — only hide its control.
+    expect(updateSettings).toHaveBeenCalledWith({ openAgentTabsInChatByDefault: false })
+    expect(updateSettings).toHaveBeenCalledTimes(1)
+    root.unmount()
+
+    const hidden = await renderExperimentalPane({
+      updateSettings,
+      settings: { ...settings, openAgentTabsInChatByDefault: false }
+    })
+
+    expect(hidden.container.textContent).not.toContain('Use updated structured native chat')
+    hidden.root.unmount()
+
+    // Returning to Chat UI restores the control still switched on.
+    const restored = await renderExperimentalPane({ updateSettings, settings })
+    const structuredSwitch = restored.container.querySelector<HTMLButtonElement>(
+      '#experimental-native-chat button[role="switch"][aria-label="Toggle updated structured native chat"]'
+    )
+    expect(structuredSwitch?.getAttribute('aria-checked')).toBe('true')
+    restored.root.unmount()
   })
 
   it('shows Chat UI default-mode as a child setting only when Chat UI is enabled', async () => {
@@ -307,6 +433,46 @@ describe('ExperimentalPane', () => {
     secondRender.root.unmount()
   })
 
+  // The two controls are nested, but each still writes only its own key.
+  it('never writes one Chat UI child setting while changing the other', async () => {
+    const updateSettings = vi.fn()
+    const settings = {
+      ...getDefaultSettings('/tmp'),
+      experimentalNativeChat: true,
+      experimentalStructuredNativeChat: false,
+      openAgentTabsInChatByDefault: true
+    }
+    const { root, container } = await renderExperimentalPane({ updateSettings, settings })
+
+    const structuredSwitch = container.querySelector<HTMLButtonElement>(
+      '#experimental-native-chat button[role="switch"][aria-label="Toggle updated structured native chat"]'
+    )
+    if (!structuredSwitch) {
+      throw new Error('Structured native chat switch was not rendered')
+    }
+
+    await act(async () => {
+      structuredSwitch.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    expect(updateSettings).toHaveBeenCalledWith({ experimentalStructuredNativeChat: true })
+
+    const terminalChatOption = Array.from(
+      container.querySelectorAll<HTMLButtonElement>('[data-slot="select-item"]')
+    ).find((button) => button.getAttribute('data-value') === 'terminal-chat')
+    if (!terminalChatOption) {
+      throw new Error('Terminal chat default-view option was not rendered')
+    }
+
+    await act(async () => {
+      terminalChatOption.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    expect(updateSettings).toHaveBeenCalledWith({ openAgentTabsInChatByDefault: false })
+    expect(updateSettings).toHaveBeenCalledTimes(2)
+    root.unmount()
+  })
+
   it('renders the agent sleep idle duration as configurable minutes', async () => {
     const updateSettings = vi.fn()
     const settings = {
@@ -347,6 +513,204 @@ describe('ExperimentalPane', () => {
     })
 
     expect(updateSettings).toHaveBeenCalledWith({ experimentalAgentHibernation: true })
+    root.unmount()
+  })
+
+  it('renders context pressure as an off-by-default searchable switch without sub-controls', () => {
+    const settings = getDefaultSettings('/tmp')
+    const markup = renderToStaticMarkup(
+      <ExperimentalPane settings={settings} updateSettings={vi.fn()} />
+    )
+
+    expect(settings.experimentalContextPressure).toBe(false)
+    expect(markup).toContain('Context pressure')
+    expect(markup).not.toContain('Warn at')
+    expect(markup).not.toContain('Soft limits')
+    expect(getExperimentalPaneSearchEntries().map((entry) => entry.title)).toContain(
+      'Context pressure'
+    )
+    // Why: getExperimentalSearchEntry() throws on a missing/renamed catalog title.
+    expect(getExperimentalSearchEntry().contextPressure.targetSectionId).toBe(
+      'experimental-context-pressure'
+    )
+  })
+
+  it('enables context pressure through the experimental switch', async () => {
+    const updateSettings = vi.fn()
+    const { root, container } = await renderExperimentalPane({ updateSettings })
+
+    const switchButton = container.querySelector<HTMLButtonElement>(
+      '#experimental-context-pressure button[role="switch"]'
+    )
+    if (!switchButton) {
+      throw new Error('Context pressure switch was not rendered')
+    }
+
+    await act(async () => {
+      switchButton.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    expect(updateSettings).toHaveBeenCalledWith({ experimentalContextPressure: true })
+    root.unmount()
+  })
+
+  it('updates warn and critical percent thresholds through their number fields', async () => {
+    const updateSettings = vi.fn()
+    const settings = {
+      ...getDefaultSettings('/tmp'),
+      experimentalContextPressure: true
+    }
+    const { root, container } = await renderExperimentalPane({ updateSettings, settings })
+
+    const [warnInput, criticalInput] = Array.from(
+      container.querySelectorAll<HTMLInputElement>(
+        '#experimental-context-pressure input[type="number"]'
+      )
+    )
+    if (!warnInput || !criticalInput) {
+      throw new Error('Context pressure threshold inputs were not rendered')
+    }
+    expect(warnInput.value).toBe('70')
+    expect(criticalInput.value).toBe('90')
+    expect(warnInput.min).toBe('1')
+    expect(warnInput.max).toBe('100')
+
+    await act(async () => {
+      setInputValue(warnInput, '75')
+    })
+    await act(async () => {
+      warnInput.dispatchEvent(new FocusEvent('focusout', { bubbles: true }))
+    })
+    expect(updateSettings).toHaveBeenCalledWith({ contextPressureWarnPercent: 75 })
+
+    await act(async () => {
+      setInputValue(criticalInput, '95')
+    })
+    await act(async () => {
+      criticalInput.dispatchEvent(new FocusEvent('focusout', { bubbles: true }))
+    })
+    expect(updateSettings).toHaveBeenCalledWith({ contextPressureCriticalPercent: 95 })
+
+    // Why: dropping critical below warn must drag warn down so the pair stays ordered.
+    await act(async () => {
+      setInputValue(criticalInput, '50')
+    })
+    await act(async () => {
+      criticalInput.dispatchEvent(new FocusEvent('focusout', { bubbles: true }))
+    })
+    expect(updateSettings).toHaveBeenCalledWith({
+      contextPressureCriticalPercent: 50,
+      contextPressureWarnPercent: 50
+    })
+    root.unmount()
+  })
+
+  it('adds and removes soft-limit rows persisting a sanitized record', async () => {
+    const updateSettings = vi.fn()
+    const settings = {
+      ...getDefaultSettings('/tmp'),
+      experimentalContextPressure: true,
+      contextPressureSoftLimits: { 'agent:codex': 100_000 }
+    }
+    const { root, container } = await renderExperimentalPane({ updateSettings, settings })
+    const section = container.querySelector('#experimental-context-pressure')
+    if (!section) {
+      throw new Error('Context pressure section was not rendered')
+    }
+
+    const addLimitButton = Array.from(section.querySelectorAll<HTMLButtonElement>('button')).find(
+      (button) => button.textContent?.trim() === 'Add limit'
+    )
+    if (!addLimitButton) {
+      throw new Error('Add limit button was not rendered')
+    }
+    await act(async () => {
+      addLimitButton.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    const draftKeyInput = section.querySelector<HTMLInputElement>(
+      'input[placeholder="global, provider:id, model:id, or agent:type"]'
+    )
+    const draftTokensInput = section.querySelector<HTMLInputElement>('input[placeholder="Tokens"]')
+    const confirmAddButton = Array.from(section.querySelectorAll<HTMLButtonElement>('button')).find(
+      (button) => button.textContent?.trim() === 'Add'
+    )
+    if (!draftKeyInput || !draftTokensInput || !confirmAddButton) {
+      throw new Error('Soft-limit draft row was not rendered')
+    }
+
+    await act(async () => {
+      setInputValue(draftKeyInput, ' AGENT:CODEX ')
+      setInputValue(draftTokensInput, '200000')
+    })
+    expect(confirmAddButton.disabled).toBe(true)
+    expect(section.querySelector('[role="alert"]')?.textContent).toContain('already exists')
+
+    // Unprefixed keys are ambiguous (model vs agent) and must be rejected inline.
+    await act(async () => {
+      setInputValue(draftKeyInput, ' claude-opus-5 ')
+      setInputValue(draftTokensInput, '200000')
+    })
+    expect(confirmAddButton.disabled).toBe(true)
+    expect(section.querySelector('[role="alert"]')?.textContent).toContain('Use global')
+
+    // Why: incomplete/invalid drafts must stay unpersistable.
+    expect(confirmAddButton.disabled).toBe(true)
+    await act(async () => {
+      setInputValue(draftKeyInput, '  model:claude-opus-5  ')
+    })
+    await act(async () => {
+      setInputValue(draftTokensInput, '400000.5')
+    })
+    expect(confirmAddButton.disabled).toBe(true)
+
+    await act(async () => {
+      setInputValue(draftTokensInput, '400000')
+    })
+    expect(confirmAddButton.disabled).toBe(false)
+    await act(async () => {
+      confirmAddButton.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    expect(updateSettings).toHaveBeenCalledWith({
+      contextPressureSoftLimits: { 'agent:codex': 100_000, 'model:claude-opus-5': 400_000 }
+    })
+
+    const removeButton = section.querySelector<HTMLButtonElement>(
+      'button[aria-label="Remove soft limit for agent:codex"]'
+    )
+    if (!removeButton) {
+      throw new Error('Soft-limit remove button was not rendered')
+    }
+    await act(async () => {
+      removeButton.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    expect(updateSettings).toHaveBeenCalledWith({ contextPressureSoftLimits: {} })
+    root.unmount()
+  })
+
+  it('reverts an existing soft-limit row when its key collides', async () => {
+    const updateSettings = vi.fn()
+    const settings = {
+      ...getDefaultSettings('/tmp'),
+      experimentalContextPressure: true,
+      contextPressureSoftLimits: { 'agent:codex': 100_000, 'model:claude-opus-5': 200_000 }
+    }
+    const { root, container } = await renderExperimentalPane({ updateSettings, settings })
+    const keyInput = Array.from(container.querySelectorAll<HTMLInputElement>('input')).find(
+      (input) => input.value === 'model:claude-opus-5'
+    )
+    if (!keyInput) {
+      throw new Error('Existing soft-limit row was not rendered')
+    }
+
+    await act(async () => {
+      setInputValue(keyInput, ' AGENT:CODEX ')
+      keyInput.dispatchEvent(new FocusEvent('focusout', { bubbles: true }))
+    })
+
+    expect(keyInput.value).toBe('model:claude-opus-5')
+    expect(updateSettings).not.toHaveBeenCalled()
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain('already exists')
     root.unmount()
   })
 

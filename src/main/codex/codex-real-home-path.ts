@@ -1,10 +1,13 @@
 import { resolve } from 'node:path'
 import { getSystemCodexHomePath } from './codex-home-paths'
-import { readShellStartupEnvVar } from '../pty/shell-startup-env'
+import { readBashStartupEnvVar, readShellStartupEnvVar } from '../pty/shell-startup-env'
+import { readPowerShellProfileEnvValues } from '../pty/powershell-profile-env'
 
 export type CodexShellStartupHomeOverride = {
   home: string
   shell?: string
+  /** Why recorded: fish reads config under it, so re-reads must use the same root. */
+  configHome?: string
   codexHome: string
 }
 
@@ -40,22 +43,22 @@ export function hasCustomCodexHomeOverrideForLaunch(launchEnv?: NodeJS.ProcessEn
 export function getCustomCodexHomeOverrideForLaunch(
   launchEnv?: NodeJS.ProcessEnv
 ): CustomCodexHomeOverrideForLaunch | null {
-  const effectiveEnv = launchEnv
-    ? {
-        CODEX_HOME: getLaunchEnvValue(launchEnv, 'CODEX_HOME'),
-        ORCA_CODEX_HOME: getLaunchEnvValue(launchEnv, 'ORCA_CODEX_HOME')
-      }
-    : process.env
+  const effectiveEnv = {
+    CODEX_HOME: getLaunchEnvValue(launchEnv, 'CODEX_HOME'),
+    ORCA_CODEX_HOME: getLaunchEnvValue(launchEnv, 'ORCA_CODEX_HOME')
+  }
   if (hasCustomCodexHomeOverride(effectiveEnv)) {
     return {
       source: 'environment',
       context: { codexHome: effectiveEnv.CODEX_HOME!.trim() }
     }
   }
-  const home = launchEnv ? getLaunchEnvValue(launchEnv, 'HOME') : process.env.HOME
-  const shell = launchEnv ? getLaunchEnvValue(launchEnv, 'SHELL') : process.env.SHELL
-  const shellCodexHome = readShellStartupEnvVar('CODEX_HOME', home, shell)
-  if (!home || !shellCodexHome || !hasCustomCodexHomeOverride({ CODEX_HOME: shellCodexHome })) {
+  // Why USERPROFILE: Windows has no HOME, and PowerShell profiles hang off it.
+  const home = getLaunchEnvValue(launchEnv, process.platform === 'win32' ? 'USERPROFILE' : 'HOME')
+  const shell = getLaunchEnvValue(launchEnv, 'SHELL')
+  const configHome = getLaunchEnvValue(launchEnv, 'XDG_CONFIG_HOME')
+  const [shellCodexHome] = readCustomShellStartupCodexHomes(home, shell, configHome)
+  if (!home || !shellCodexHome) {
     return null
   }
   return {
@@ -63,6 +66,7 @@ export function getCustomCodexHomeOverrideForLaunch(
     context: {
       home,
       ...(shell ? { shell } : {}),
+      ...(configHome ? { configHome } : {}),
       codexHome: shellCodexHome
     }
   }
@@ -82,15 +86,13 @@ export function shellStartupCodexHomeOverrideMatches(
   if (!shellStartupCodexHomeOverrideContextsEqual(context, currentContext)) {
     return false
   }
-  const currentCodexHome = readShellStartupEnvVar(
-    'CODEX_HOME',
+  return readCustomShellStartupCodexHomes(
     currentContext.home,
-    currentContext.shell
-  )
-  return Boolean(
-    currentCodexHome &&
-    hasCustomCodexHomeOverride({ CODEX_HOME: currentCodexHome }) &&
-    normalizePathForComparison(currentCodexHome) === normalizePathForComparison(context.codexHome)
+    currentContext.shell,
+    currentContext.configHome
+  ).some(
+    (codexHome) =>
+      normalizePathForComparison(codexHome) === normalizePathForComparison(context.codexHome)
   )
 }
 
@@ -101,15 +103,49 @@ export function shellStartupCodexHomeOverrideContextsEqual(
   return (
     normalizePathForComparison(left.home) === normalizePathForComparison(right.home) &&
     left.shell === right.shell &&
+    left.configHome === right.configHome &&
     normalizePathForComparison(left.codexHome) === normalizePathForComparison(right.codexHome)
   )
 }
 
+/**
+ * Custom CODEX_HOMEs the pane's shell startup may set. A Windows pane may run
+ * either PowerShell edition or Git Bash, so any of their startup files counts.
+ */
+function readCustomShellStartupCodexHomes(
+  home: string | undefined,
+  shell: string | undefined,
+  configHome: string | undefined
+): string[] {
+  if (!home) {
+    return []
+  }
+  const candidates =
+    process.platform === 'win32'
+      ? [
+          ...readPowerShellProfileEnvValues('CODEX_HOME', home),
+          readBashStartupEnvVar('CODEX_HOME', home)
+        ]
+      : [readShellStartupEnvVar('CODEX_HOME', home, shell, configHome)]
+  return candidates.filter(
+    (codexHome): codexHome is string =>
+      codexHome !== undefined && hasCustomCodexHomeOverride({ CODEX_HOME: codexHome })
+  )
+}
+
+type LaunchEnvKey =
+  | 'CODEX_HOME'
+  | 'ORCA_CODEX_HOME'
+  | 'HOME'
+  | 'USERPROFILE'
+  | 'SHELL'
+  | 'XDG_CONFIG_HOME'
+
 function getLaunchEnvValue(
-  launchEnv: NodeJS.ProcessEnv,
-  key: 'CODEX_HOME' | 'ORCA_CODEX_HOME' | 'HOME' | 'SHELL'
+  launchEnv: NodeJS.ProcessEnv | undefined,
+  key: LaunchEnvKey
 ): string | undefined {
-  return Object.prototype.hasOwnProperty.call(launchEnv, key) ? launchEnv[key] : process.env[key]
+  return launchEnv && Object.hasOwn(launchEnv, key) ? launchEnv[key] : process.env[key]
 }
 
 function normalizePathForComparison(value: string): string {

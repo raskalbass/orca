@@ -10,6 +10,7 @@ import { TooltipProvider } from '@/components/ui/tooltip'
 import { AgentKanbanCard } from './AgentKanbanCard'
 
 const agentIconRender = vi.fn()
+const agentStateDotRender = vi.fn()
 
 vi.mock('@/lib/agent-catalog', () => ({
   AgentIcon: () => {
@@ -19,7 +20,10 @@ vi.mock('@/lib/agent-catalog', () => ({
 }))
 
 vi.mock('@/components/AgentStateDot', () => ({
-  AgentStateDot: () => <span data-testid="state-dot" />
+  AgentStateDot: ({ state }: { state: string }) => {
+    agentStateDotRender(state)
+    return <span data-testid="state-dot" />
+  }
 }))
 
 function card(overrides: Partial<DashboardCard> = {}): DashboardCard {
@@ -40,6 +44,19 @@ function card(overrides: Partial<DashboardCard> = {}): DashboardCard {
     finishedAt: null,
     stateChangedAt: 1_000,
     unseen: false,
+    ...overrides
+  }
+}
+
+function pressure(
+  overrides: Partial<NonNullable<DashboardCard['contextPressure']>> = {}
+): NonNullable<DashboardCard['contextPressure']> {
+  return {
+    level: 'warning',
+    usedPercent: 80,
+    usedTokens: 160_000,
+    limitTokens: 200_000,
+    limitSource: 'provider',
     ...overrides
   }
 }
@@ -102,6 +119,23 @@ describe('AgentKanbanCard', () => {
     expect(container.querySelector('.lucide-message-circle-question-mark')).toBeNull()
   })
 
+  it('shows the saved SSH host beside the repository metadata', () => {
+    const { container } = renderCard({
+      card: card({
+        hostKind: 'ssh',
+        executionHostId: 'ssh:opaque-target',
+        hostLabel: 'openclaw'
+      }),
+      now: 2_000
+    })
+
+    expect(screen.getByLabelText('SSH host · openclaw')).toHaveAttribute(
+      'data-dashboard-host-badge',
+      'ssh'
+    )
+    expect(container.querySelector('.lucide-server')).toBeInTheDocument()
+  })
+
   it('shows review metadata and expands grouped subagents without opening the terminal', () => {
     const onOpenTerminal = vi.fn()
     renderCard({
@@ -159,29 +193,29 @@ describe('AgentKanbanCard', () => {
     expect(screen.queryByRole('img', { name: 'In review' })).not.toBeInTheDocument()
   })
 
-  it('tints attention amber and done green, leaving every other state neutral', () => {
+  it('tints unseen Done green and keeps acknowledged Done neutral as Idle', () => {
     const { container: attention } = renderCard({
       card: card({ bucket: 'attention', dotState: 'waiting' }),
       now: 2_000
     })
-    expect(attention.firstElementChild?.className).toContain('border-amber-500/40')
+    expect(attention.firstElementChild?.className).toContain('border-agent-question/40')
 
     cleanup()
     const { container: done } = renderCard({
-      card: card({ bucket: 'idle', dotState: 'done' }),
+      card: card({ bucket: 'done', dotState: 'done', unseen: true }),
       now: 2_000
     })
     expect(done.firstElementChild?.className).toContain('border-emerald-500/40')
 
     cleanup()
     const { container: idle } = renderCard({
-      card: card({ bucket: 'idle', dotState: 'idle' }),
+      card: card({ bucket: 'idle', dotState: 'done', unseen: false }),
       now: 2_000
     })
     const idleClassName = idle.firstElementChild?.className ?? ''
     expect(idleClassName).toContain('border-border/60')
     expect(idleClassName).not.toContain('emerald')
-    expect(idleClassName).not.toContain('amber')
+    expect(idleClassName).not.toContain('agent-question')
   })
 
   it('heads the card with the conversation name and drops the worktree to the footer', () => {
@@ -265,6 +299,128 @@ describe('AgentKanbanCard', () => {
     )
     expect(agentIconRender).toHaveBeenCalledTimes(2)
     expect(screen.getByText('2m')).toBeInTheDocument()
+  })
+
+  it('renders the context-pressure dot beside the state dot from the snapshot field', () => {
+    const { container } = renderCard({
+      card: card({ contextPressure: pressure({ level: 'critical', usedPercent: 95 }) }),
+      now: 2_000
+    })
+
+    expect(container.querySelector('[data-context-pressure="critical"]')).not.toBeNull()
+    expect(screen.getByTestId('state-dot')).toBeInTheDocument()
+  })
+
+  it('keeps the context-pressure dot when a pending question replaces the state dot', () => {
+    const { container } = renderCard({
+      card: card({
+        bucket: 'attention',
+        dotState: 'waiting',
+        askSummary: 'Approve deploy?',
+        contextPressure: pressure({ usedPercent: 82 })
+      }),
+      now: 2_000
+    })
+
+    expect(container.querySelector('[data-context-pressure="warning"]')).not.toBeNull()
+    expect(screen.queryByTestId('state-dot')).not.toBeInTheDocument()
+  })
+
+  it('renders no indicator when the snapshot has no context pressure', () => {
+    const { container } = renderCard({ card: card(), now: 2_000 })
+
+    expect(container.querySelector('[data-context-pressure]')).toBeNull()
+  })
+
+  it('rerenders on a context-pressure change but not on an identical clone', () => {
+    const onOpenTerminal = vi.fn()
+    const initial = card({
+      startedAt: 0,
+      contextPressure: pressure()
+    })
+    const { container, rerender } = render(
+      <TooltipProvider>
+        <AgentKanbanCard card={initial} now={2_000} onOpenTerminal={onOpenTerminal} />
+      </TooltipProvider>
+    )
+    expect(agentIconRender).toHaveBeenCalledTimes(1)
+
+    // A fresh structured clone with equal pressure must reuse the memoized card.
+    rerender(
+      <TooltipProvider>
+        <AgentKanbanCard
+          card={{ ...initial, contextPressure: { ...initial.contextPressure! } }}
+          now={2_000}
+          onOpenTerminal={onOpenTerminal}
+        />
+      </TooltipProvider>
+    )
+    expect(agentIconRender).toHaveBeenCalledTimes(1)
+
+    rerender(
+      <TooltipProvider>
+        <AgentKanbanCard
+          card={{
+            ...initial,
+            contextPressure: pressure({
+              usedPercent: 80,
+              usedTokens: 800_000,
+              limitTokens: 1_000_000,
+              limitSource: 'soft-cap'
+            })
+          }}
+          now={2_000}
+          onOpenTerminal={onOpenTerminal}
+        />
+      </TooltipProvider>
+    )
+    expect(agentIconRender).toHaveBeenCalledTimes(2)
+
+    rerender(
+      <TooltipProvider>
+        <AgentKanbanCard
+          card={{
+            ...initial,
+            contextPressure: pressure({ level: 'critical', usedPercent: 95 })
+          }}
+          now={2_000}
+          onOpenTerminal={onOpenTerminal}
+        />
+      </TooltipProvider>
+    )
+    expect(agentIconRender).toHaveBeenCalledTimes(3)
+    expect(container.querySelector('[data-context-pressure="critical"]')).not.toBeNull()
+
+    // Dropping the field entirely (agent back under the warn threshold) re-renders too.
+    rerender(
+      <TooltipProvider>
+        <AgentKanbanCard
+          card={{ ...initial, contextPressure: undefined }}
+          now={2_000}
+          onOpenTerminal={onOpenTerminal}
+        />
+      </TooltipProvider>
+    )
+    expect(agentIconRender).toHaveBeenCalledTimes(4)
+    expect(container.querySelector('[data-context-pressure]')).toBeNull()
+  })
+
+  it('rerenders when a working card enters monitoring', () => {
+    const initial = card()
+    const { rerender } = renderCard({ card: initial, now: 2_000 })
+    expect(agentStateDotRender).toHaveBeenLastCalledWith('working')
+
+    rerender(
+      <TooltipProvider>
+        <AgentKanbanCard
+          card={{ ...initial, workingMode: 'monitoring' }}
+          now={2_000}
+          onOpenTerminal={vi.fn()}
+        />
+      </TooltipProvider>
+    )
+
+    expect(agentStateDotRender).toHaveBeenLastCalledWith('monitoring')
   })
 
   it('rerenders when the repo icon changes', () => {

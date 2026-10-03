@@ -1,11 +1,23 @@
-import { memo } from 'react'
-import { Bell, ChevronDown, ChevronRight, GitBranch, GitPullRequest } from 'lucide-react-native'
+import { memo, useMemo } from 'react'
+import {
+  Bell,
+  ChevronDown,
+  ChevronRight,
+  GitBranch,
+  GitPullRequest,
+  Monitor,
+  Server
+} from 'lucide-react-native'
 import { Pressable, StyleSheet, Text, View } from 'react-native'
-import type { RepoIcon } from '../../../src/shared/repo-icon'
+import { parseExecutionHostId, type ExecutionHostId } from '../../../src/shared/execution-host'
+import type { AgentWorkingMode } from '../../../src/shared/agent-status-types'
 import type { RuntimeWorktreeAgentRow } from '../../../src/shared/runtime-types'
+import type { MobileRenderableRepoIcon } from '../host-screen/host-screen-reply-schema'
 import { triggerMediumImpact } from '../platform/haptics'
 import { colors, radii, spacing, typography } from '../theme/mobile-theme'
+import { worstAgentContextPressure } from '../worktree/context-pressure-display'
 import { AgentSpinner } from './AgentSpinner'
+import { ContextPressureDot } from './ContextPressureDot'
 import { MobileRepoIcon } from './MobileRepoIcon'
 import { WorktreeAgentList } from './WorktreeAgentList'
 import { WorktreeMetaGlyphs, prStateColor } from './WorktreeMetaGlyphs'
@@ -21,6 +33,11 @@ function displayBranch(branch: string): string {
 export type WorktreeListRowItem = {
   workspaceKind?: 'git' | 'folder-workspace'
   worktreeId: string
+  hostId?: ExecutionHostId
+  /** Present only when the list spans hosts; names the host this row runs on. */
+  hostContextLabel?: string
+  /** Resolved host for the display label; present when legacy rows omit hostId. */
+  hostContextHostId?: ExecutionHostId
   repo: string
   branch: string
   displayName: string
@@ -39,6 +56,7 @@ export type WorktreeListRowItem = {
   lineageChildCount?: number
   lineageCollapsed?: boolean
   agents?: RuntimeWorktreeAgentRow[]
+  workingMode?: AgentWorkingMode
 }
 
 type WorktreeRollupStatus = 'working' | 'active' | 'permission' | 'done' | 'inactive'
@@ -48,7 +66,7 @@ type Props<T extends WorktreeListRowItem> = {
   isReadOnly: boolean
   now: number
   repoColor: string
-  repoIcon?: RepoIcon | null
+  repoIcon?: MobileRenderableRepoIcon | null
   // When the list is already grouped under this repo's section header, the row
   // omits its own repo icon+name to avoid the redundant "📁 orca" on every row.
   hideRepo?: boolean
@@ -75,6 +93,9 @@ function WorktreeListRowComponent<T extends WorktreeListRowItem>({
   const metaText = isFolderWorkspace ? folderMeta : displayBranch(item.branch)
   const lineageDepth = Math.max(0, item.lineageDepth ?? 0)
   const lineageChildCount = item.lineageChildCount ?? 0
+  const agents = item.agents
+  // Worktree rollups show only the worst warning or critical child.
+  const contextPressure = useMemo(() => worstAgentContextPressure(agents ?? []), [agents])
 
   return (
     <Pressable
@@ -97,7 +118,7 @@ function WorktreeListRowComponent<T extends WorktreeListRowItem>({
       delayLongPress={400}
     >
       <View style={styles.indicatorCol}>
-        <AgentSpinner status={status} />
+        <AgentSpinner status={status} workingMode={item.workingMode} />
         {item.unread && (
           <Bell
             size={10}
@@ -148,6 +169,20 @@ function WorktreeListRowComponent<T extends WorktreeListRowItem>({
               <Text style={styles.childBadgeText}>Child</Text>
             </View>
           )}
+          {item.hostContextLabel ? (
+            <View style={[styles.childBadge, styles.hostBadge]}>
+              {/* Rows from hosts that predate hostId stamping are local: a remote row always carries one. */}
+              {(parseExecutionHostId(item.hostContextHostId ?? item.hostId)?.kind ?? 'local') ===
+              'local' ? (
+                <Monitor size={10} color={colors.textMuted} />
+              ) : (
+                <Server size={10} color={colors.textMuted} />
+              )}
+              <Text style={[styles.childBadgeText, styles.hostBadgeText]} numberOfLines={1}>
+                {item.hostContextLabel}
+              </Text>
+            </View>
+          ) : null}
           {/* Repo glyph+name only when not already grouped under this repo;
               MobileRepoIcon falls back to a Folder (matching desktop's default)
               rather than a bare colored dot. */}
@@ -162,6 +197,7 @@ function WorktreeListRowComponent<T extends WorktreeListRowItem>({
           <Text style={styles.branchName} numberOfLines={1}>
             {metaText}
           </Text>
+          {contextPressure ? <ContextPressureDot pressure={contextPressure} /> : null}
         </View>
         {/* Only agents get a secondary activity line, matching desktop. A plain
             terminal's shell-output tail is intentionally not surfaced here. */}
@@ -303,6 +339,13 @@ const styles = StyleSheet.create({
   childBadgeText: {
     fontSize: 10,
     color: colors.textMuted
+  },
+  hostBadge: {
+    flexShrink: 1,
+    maxWidth: 140
+  },
+  hostBadgeText: {
+    flexShrink: 1
   },
   lineageToggle: {
     alignSelf: 'flex-start',

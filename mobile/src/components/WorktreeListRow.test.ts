@@ -13,9 +13,10 @@ import type { RuntimeWorktreeAgentRow } from '../../../src/shared/runtime-types'
 import { WorktreeAgentRow } from './WorktreeAgentRow'
 import { WorktreeListRow, type WorktreeListRowItem } from './WorktreeListRow'
 
-const { agentSpinnerRender, agentStateDotRender } = vi.hoisted(() => ({
+const { agentSpinnerRender, agentStateDotRender, contextPressureDotRender } = vi.hoisted(() => ({
   agentSpinnerRender: vi.fn(),
-  agentStateDotRender: vi.fn()
+  agentStateDotRender: vi.fn(),
+  contextPressureDotRender: vi.fn()
 }))
 
 vi.mock('react-native', () => ({
@@ -30,7 +31,9 @@ vi.mock('lucide-react-native', () => ({
   ChevronDown: 'ChevronDown',
   ChevronRight: 'ChevronRight',
   GitBranch: 'GitBranch',
-  GitPullRequest: 'GitPullRequest'
+  GitPullRequest: 'GitPullRequest',
+  Monitor: 'Monitor',
+  Server: 'Server'
 }))
 
 vi.mock('../platform/haptics', () => ({ triggerMediumImpact: vi.fn() }))
@@ -43,6 +46,12 @@ vi.mock('./AgentSpinner', () => ({
 vi.mock('./AgentStateDot', () => ({
   AgentStateDot: (props: unknown) => {
     agentStateDotRender(props)
+    return null
+  }
+}))
+vi.mock('./ContextPressureDot', () => ({
+  ContextPressureDot: (props: unknown) => {
+    contextPressureDotRender(props)
     return null
   }
 }))
@@ -127,9 +136,9 @@ describe('memoized worktree rows', () => {
   let renderer: ReactTestRenderer | null = null
 
   beforeEach(() => {
-    ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
     agentSpinnerRender.mockClear()
     agentStateDotRender.mockClear()
+    contextPressureDotRender.mockClear()
   })
 
   afterEach(() => {
@@ -200,7 +209,7 @@ describe('memoized worktree rows', () => {
     await act(async () => {
       renderer!.update(
         createElement(WorktreeAgentRow, {
-          agent: agent({ state: 'done', updatedAt: 2_000 }),
+          agent: agent({ state: 'working', workingMode: 'monitoring', updatedAt: 2_000 }),
           depth: 0,
           now: 2_000,
           unvisited: false
@@ -208,5 +217,125 @@ describe('memoized worktree rows', () => {
       )
     })
     expect(agentStateDotRender).toHaveBeenCalledTimes(2)
+    expect(agentStateDotRender).toHaveBeenLastCalledWith({ state: 'monitoring' })
+  })
+
+  it('passes workspace monitoring mode to the status indicator', async () => {
+    await act(async () => {
+      renderer = create(
+        createElement(ListRowHarness, {
+          item: { ...baseItem, status: 'working', workingMode: 'monitoring' },
+          now: 2_000
+        })
+      )
+    })
+
+    expect(agentSpinnerRender).toHaveBeenLastCalledWith({
+      status: 'working',
+      workingMode: 'monitoring'
+    })
+  })
+
+  it('names the host with a glyph that matches the host kind', async () => {
+    const textNodes = (): string[] =>
+      renderer!.root
+        .findAllByType('Text' as never)
+        .flatMap((node) => node.props.children)
+        .filter((child): child is string => typeof child === 'string')
+
+    await act(async () => {
+      renderer = create(
+        createElement(ListRowHarness, {
+          item: { ...baseItem, hostId: 'ssh:ssh-1', hostContextLabel: 'openclaw' },
+          now: 2_000
+        })
+      )
+    })
+    expect(textNodes()).toContain('openclaw')
+    expect(renderer!.root.findAllByType('Server' as never)).toHaveLength(1)
+    expect(renderer!.root.findAllByType('Monitor' as never)).toHaveLength(0)
+
+    await act(async () =>
+      renderer!.update(
+        createElement(ListRowHarness, {
+          item: { ...baseItem, hostContextLabel: 'Local Mac' },
+          now: 2_000
+        })
+      )
+    )
+    expect(textNodes()).toContain('Local Mac')
+    expect(renderer!.root.findAllByType('Monitor' as never)).toHaveLength(1)
+
+    await act(async () =>
+      renderer!.update(createElement(ListRowHarness, { item: baseItem, now: 2_000 }))
+    )
+    expect(textNodes()).not.toContain('Local Mac')
+    expect(renderer!.root.findAllByType('Monitor' as never)).toHaveLength(0)
+  })
+
+  it('shows per-agent context pressure at every level and nothing when absent', async () => {
+    // No host-computed pressure (gate off / no data / older host) → no dot.
+    await act(async () => {
+      renderer = create(
+        createElement(WorktreeAgentRow, { agent: agent(), depth: 0, now: 2_000, unvisited: false })
+      )
+    })
+    expect(contextPressureDotRender).not.toHaveBeenCalled()
+
+    // Per-agent rows show all three levels, including 'ok' (desktop row policy).
+    await act(async () => {
+      renderer!.update(
+        createElement(WorktreeAgentRow, {
+          agent: agent({
+            contextPressure: {
+              level: 'ok',
+              usedPercent: 12,
+              usedTokens: 24_000,
+              limitTokens: 200_000,
+              limitSource: 'provider'
+            }
+          }),
+          depth: 0,
+          now: 2_000,
+          unvisited: false
+        })
+      )
+    })
+    expect(contextPressureDotRender).toHaveBeenCalledWith({
+      pressure: {
+        level: 'ok',
+        usedPercent: 12,
+        usedTokens: 24_000,
+        limitTokens: 200_000,
+        limitSource: 'provider'
+      }
+    })
+  })
+
+  it('shows the worst-of context pressure rollup only at warning/critical', async () => {
+    const okOnly: TestItem = {
+      ...baseItem,
+      agents: [agent({ contextPressure: { level: 'ok', usedPercent: 30 } })]
+    }
+    await act(async () => {
+      renderer = create(createElement(ListRowHarness, { item: okOnly, now: 2_000 }))
+    })
+    // Aggregate surface stays quiet at 'ok' (WorktreeAgentList is mocked, so any
+    // call here is the row's own rollup dot).
+    expect(contextPressureDotRender).not.toHaveBeenCalled()
+
+    const mixed: TestItem = {
+      ...baseItem,
+      agents: [
+        agent({ contextPressure: { level: 'warning', usedPercent: 75 } }),
+        agent({ paneKey: 'agent-2', contextPressure: { level: 'critical', usedPercent: 92 } })
+      ]
+    }
+    await act(async () => {
+      renderer!.update(createElement(ListRowHarness, { item: mixed, now: 2_000 }))
+    })
+    expect(contextPressureDotRender).toHaveBeenCalledWith({
+      pressure: { level: 'critical', usedPercent: 92 }
+    })
   })
 })

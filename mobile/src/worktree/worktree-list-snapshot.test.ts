@@ -21,6 +21,13 @@ function agent(overrides: Partial<RuntimeWorktreeAgentRow> = {}): RuntimeWorktre
   }
 }
 
+function done(
+  outcome: 'success' | 'failure',
+  stateStartedAt = 1
+): NonNullable<RuntimeWorktreeAgentRow['mainAgent']> {
+  return { state: 'done', outcome, stateStartedAt }
+}
+
 function worktree(overrides: Partial<Worktree> = {}): Worktree {
   const worktreePath = join('/tmp', 'orca', 'worktrees', 'manta')
   return {
@@ -160,10 +167,97 @@ describe('areWorktreeListsEqual', () => {
     expect(areWorktreeListsEqual(first, second)).toBe(false)
   })
 
+  it('detects a verdict change that leaves the interrupted flag as it was', () => {
+    const first = [worktree({ agents: [agent({ state: 'done', mainAgent: done('success') })] })]
+    const second = [worktree({ agents: [agent({ state: 'done', mainAgent: done('failure') })] })]
+
+    expect(areWorktreeListsEqual(first, second)).toBe(false)
+  })
+
+  it('detects a main agent failing while its subagents keep the row working', () => {
+    const first = [worktree({ agents: [agent({ state: 'working' })] })]
+    const second = [worktree({ agents: [agent({ state: 'working', mainAgent: done('failure') })] })]
+
+    expect(areWorktreeListsEqual(first, second)).toBe(false)
+  })
+
+  it('detects the main agent clock moving, which dates a failure', () => {
+    const at = (stateStartedAt: number) => [
+      worktree({
+        agents: [agent({ state: 'working', mainAgent: done('failure', stateStartedAt) })]
+      })
+    ]
+
+    expect(areWorktreeListsEqual(at(1), at(2))).toBe(false)
+    expect(areWorktreeListsEqual(at(1), at(1))).toBe(true)
+  })
+
+  it('detects monitoring mode changes within working', () => {
+    const first = [worktree({ agents: [agent({ state: 'working' })] })]
+    const second = [worktree({ agents: [agent({ state: 'working', workingMode: 'monitoring' })] })]
+
+    expect(areWorktreeListsEqual(first, second)).toBe(false)
+  })
+
+  it('detects workspace monitoring mode changes within working', () => {
+    const first = [worktree({ status: 'working' })]
+    const second = [worktree({ status: 'working', workingMode: 'monitoring' })]
+
+    expect(areWorktreeListsEqual(first, second)).toBe(false)
+  })
+
   it('treats missing and empty agent arrays as equivalent for rendering', () => {
     const first = [worktree({ agents: undefined })]
     const second = [worktree({ agents: [] })]
 
     expect(areWorktreeListsEqual(first, second)).toBe(true)
+  })
+
+  it('detects agent context-pressure changes', () => {
+    const base = [
+      worktree({ agents: [agent({ contextPressure: { level: 'warning', usedPercent: 75 } })] })
+    ]
+
+    // Unchanged reading (host pre-clamps to integers) compares equal across polls.
+    expect(
+      areWorktreeListsEqual(base, [
+        worktree({ agents: [agent({ contextPressure: { level: 'warning', usedPercent: 75 } })] })
+      ])
+    ).toBe(true)
+    expect(
+      areWorktreeListsEqual(base, [
+        worktree({ agents: [agent({ contextPressure: { level: 'critical', usedPercent: 92 } })] })
+      ])
+    ).toBe(false)
+    expect(
+      areWorktreeListsEqual(base, [
+        worktree({ agents: [agent({ contextPressure: { level: 'warning', usedPercent: 80 } })] })
+      ])
+    ).toBe(false)
+    // Reading disappearing (gate turned off host-side) must clear the indicator.
+    expect(areWorktreeListsEqual(base, [worktree({ agents: [agent()] })])).toBe(false)
+  })
+
+  it('detects exact pressure detail changes at the same rounded percentage', () => {
+    const pressure = {
+      level: 'critical' as const,
+      usedPercent: 95,
+      usedTokens: 190_000,
+      limitTokens: 200_000,
+      limitSource: 'model' as const,
+      usedTokensSource: 'provider' as const
+    }
+    const base = [worktree({ agents: [agent({ contextPressure: pressure })] })]
+
+    for (const contextPressure of [
+      { ...pressure, usedTokens: 950_000 },
+      { ...pressure, limitTokens: 1_000_000 },
+      { ...pressure, limitSource: 'soft-cap' as const },
+      { ...pressure, usedTokensSource: 'derived-percent' as const }
+    ]) {
+      expect(
+        areWorktreeListsEqual(base, [worktree({ agents: [agent({ contextPressure })] })])
+      ).toBe(false)
+    }
   })
 })
