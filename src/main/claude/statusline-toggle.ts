@@ -77,7 +77,13 @@ export async function installRemoteClaudeStatusLineForHome(
 ): Promise<HooksConfig> {
   const scriptFileName = getStatusLineScriptFileName(settings)
   const scriptPath = `${remoteHome.replace(/\/$/, '')}/.orca/agent-hooks/${scriptFileName}`
-  return installRemoteClaudeStatusLine(sftp, config, scriptPath, scriptFileName, contextPressureEnabled)
+  return installRemoteClaudeStatusLine(
+    sftp,
+    config,
+    scriptPath,
+    scriptFileName,
+    contextPressureEnabled
+  )
 }
 
 export async function installRemoteClaudeStatusLine(

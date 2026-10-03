@@ -257,7 +257,8 @@ export class RelayAgentHookServer extends RelayAgentHookCanonicalStatus {
       ingestTmuxHook: (source, body) => this.ingestCanonicalTmuxHook(source, body, this.env),
       retryScheduler: this.retryScheduler,
       transportInterference: this.transportInterference,
-      handleClaudeStatusline: (body) => this.contextPressure.handleClaudeStatusline(body, this.forward)
+      handleClaudeStatusline: (body) =>
+        this.contextPressure.handleClaudeStatusline(body, this.forward)
     })
   }
 

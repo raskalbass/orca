@@ -243,9 +243,7 @@ export function buildDashboardSnapshot(
         review: context?.review,
         subagents: subagentsByParentPaneKey?.get(row.paneKey),
         lastUserMessage: isTitleDerived ? undefined : nonEmpty(row.entry.prompt),
-        lastAgentMessage: isTitleDerived
-          ? undefined
-          : nonEmpty(row.entry.lastAssistantMessage),
+        lastAgentMessage: isTitleDerived ? undefined : nonEmpty(row.entry.lastAssistantMessage),
         startedAt: row.startedAt,
         finishedAt,
         stateChangedAt: row.entry.stateStartedAt || row.startedAt,

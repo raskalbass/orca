@@ -41,9 +41,8 @@ describe('worktree.ps context pressure', () => {
       storeWithSettings({ experimentalContextPressure: true }),
       undefined,
       {
-        getAgentStatusSnapshot: () => [
-          hookRow({ usedTokens: 150_000, maxTokens: 200_000 })
-        ] as never[]
+        getAgentStatusSnapshot: () =>
+          [hookRow({ usedTokens: 150_000, maxTokens: 200_000 })] as never[]
       }
     ).getWorktreePs()
 
@@ -61,9 +60,8 @@ describe('worktree.ps context pressure', () => {
 
   it('omits context pressure from agent rows when the experimental flag is off', async () => {
     const { worktrees } = await new OrcaRuntimeService(storeWithSettings({}), undefined, {
-      getAgentStatusSnapshot: () => [
-        hookRow({ usedTokens: 150_000, maxTokens: 200_000 })
-      ] as never[]
+      getAgentStatusSnapshot: () =>
+        [hookRow({ usedTokens: 150_000, maxTokens: 200_000 })] as never[]
     }).getWorktreePs()
 
     const worktree = worktrees.find((entry) => entry.worktreeId === TEST_WORKTREE_ID)
@@ -80,9 +78,8 @@ describe('worktree.ps context pressure', () => {
       }),
       undefined,
       {
-        getAgentStatusSnapshot: () => [
-          hookRow({ usedTokens: 150_000, maxTokens: 200_000 })
-        ] as never[]
+        getAgentStatusSnapshot: () =>
+          [hookRow({ usedTokens: 150_000, maxTokens: 200_000 })] as never[]
       }
     ).getWorktreePs()
 

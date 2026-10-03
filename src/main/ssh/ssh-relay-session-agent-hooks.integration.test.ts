@@ -274,10 +274,7 @@ describe('SshRelaySession agent hooks over a fake relay transport', () => {
     await vi.waitFor(() => expect(relay?.contextPressureSettings).toEqual([false]))
     settings.enabled = true
     for (const listener of settings.listeners) {
-      listener(
-        { experimentalContextPressure: true },
-        { experimentalContextPressure: true }
-      )
+      listener({ experimentalContextPressure: true }, { experimentalContextPressure: true })
     }
     await vi.waitFor(() => expect(relay?.contextPressureSettings).toEqual([false, true]))
   })
